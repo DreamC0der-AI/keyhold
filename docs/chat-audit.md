@@ -59,13 +59,25 @@ All with tests in `tests/attacks.test.ts` and `tests/chat.test.ts`:
 8. **Deep imports from ts-mls.** The client uses three internal ts-mls modules (`messageProtection`, `keyPackage`, `ratchetTree`) to learn the sender of a message, which ts-mls doesn't return. The version is pinned exactly (1.6.4).
 9. **History backup tradeoff.** On by default. Anyone who gets K can read the backed-up history.
 
-## Not tested against real GitHub
+## Live run against real GitHub
 
-The sandbox can't reach GitHub, so the GitHub provider was tested against `tests/github-mock.ts`, an in-memory GitHub that copies the behaviour the provider relies on. Before production, these need a live run (the earlier live checks in this project covered repo creation, invites and read/write, not the rest):
+On 2026-11-05, `scripts/live-github.ts` passed all 16 steps with two real accounts. Each account had the GitHub App installed with "Only select repositories". The run checked:
 
-- Contents API compare-and-swap under real concurrency (two creates of the same path, and 409s caused by unrelated commits racing on the branch).
-- Files over 1 MB through the git blob API, and attachment uploads near the size limit.
-- `GET /user/installations` and `/user/installations/{id}/repositories` with a GitHub App user token for an invitee who has no installation.
-- Collaborator self-removal, and listing invitations as the owner.
-- Request budget: an idle sync costs 5 requests per chat against the mock (mail, day and log folders, drop box, plus channel checks every 10 minutes for owners). At 5,000 requests an hour that is about 16 chats polled every minute, so a real app should poll quiet chats less often.
-- The Worker inbox with real App tokens.
+- publishing directories and looking them up across accounts;
+- a DM (repo, ticket, collaborator invite, Worker inbox, accept, external join, messages both ways);
+- a 1.5 MB attachment through the git blob API;
+- compare-and-swap with two writers racing on the same log index five times (exactly one won each time);
+- a group invite, join and talk;
+- a member leaving, which removed them as a collaborator;
+- a removal, after which the removed member sees `access-lost` and can't read the log.
+
+An idle sync costs 5 requests for both owner and member, the same as against the mock.
+
+Still not covered live:
+
+- 409s caused by unrelated commits racing on the branch under heavy load;
+- files near the size limit;
+- the request budget over hours of polling (at 5,000 requests an hour, polling every minute covers about 16 chats, so a real app should poll quiet chats less often);
+- the offline add path (box 4), which the GitHub provider doesn't offer.
+
+Run it again with `npm run build:live && node scripts/live-github.mjs <loginA> <loginB>`. The script uses its own repo names (`keyhold-live-*`, `ghchat-live-*`), deletes them at the end, and never writes tokens or keys to its report.
