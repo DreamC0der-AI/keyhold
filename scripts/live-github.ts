@@ -207,7 +207,8 @@ async function main() {
       const g2 = await a.chat.createGroup('group', 'removal');
       await g2.invite(b.address);
       const g2b = await until('join', async () => (await b.chat.acceptInvites()).find((x) => x.id === g2.id));
-      await g2.remove(g2.members().find((m) => m.address === b.address)!.fingerprint);
+      const fb = await until('A sees the join', async () => (await g2.sync(), g2.members().find((m) => m.address === b.address)), 60_000);
+      await g2.remove(fb.fingerprint);
       const r = await g2b.sync();
       check(!g2b.active, 'B still active');
       const canRead = await b.provider.orderedLog.read(g2.space, 0).then(() => true, () => false);
