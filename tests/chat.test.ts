@@ -269,15 +269,15 @@ describe('personal synced store (box 12) and root backup (box 9)', () => {
     await phone.flush();
     expect(await laptop.contact('github:bob')).toEqual({ nickname: 'Bobby', verified: true });
     // read marks: many changes, one write per flush
-    for (let i = 0; i < 50; i++) await phone.setReadMark('g1', `m${i}`);
+    for (let i = 0; i < 50; i++) await phone.setReadMark('group-quokka', `mark-${i}`);
     expect(await phone.flush()).toBe(1);
-    expect(await laptop.get('readMarks', 'g1')).toEqual({ at: 'm49' });
-    // storage sees only opaque ids and ciphertext
+    expect(await laptop.get('readMarks', 'group-quokka')).toEqual({ at: 'mark-49' });
+    // storage sees only opaque ids and ciphertext (markers long enough not to appear in random base64)
     const ids = (await p.personal.list()).map((i) => i.id);
-    expect(ids.join(',')).not.toMatch(/bob|contacts|readMarks|g1/);
+    expect(ids.join(',')).not.toMatch(/github:bob|contacts|readMarks|quokka/);
     for (const id of ids) {
       const raw = Buffer.from((await p.personal.get(id))!.data).toString('latin1');
-      expect(raw).not.toMatch(/Bobby|github:bob|m49/);
+      expect(raw).not.toMatch(/Bobby|github:bob|quokka|mark-49/);
     }
     // a key without K can't read
     const other = await k();
