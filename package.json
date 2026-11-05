@@ -57,7 +57,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "prepare": "npm run build",
-    "test:browser": "node tests/browser/run.mjs"
+    "test:browser": "node tests/browser/run.mjs",
+    "build:live": "esbuild scripts/live-github.ts --bundle --platform=node --format=esm --outfile=scripts/live-github.mjs"
   },
   "dependencies": {
     "@noble/curves": "^2.4.0",
