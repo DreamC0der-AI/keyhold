@@ -21,6 +21,34 @@ The interfaces between them:
 
 The design these follow is in the "E2E encrypted notes with Apple and Google login" doc.
 
+## Encrypted chat: where every piece of data lives
+
+Keyhold also powers end-to-end encrypted chat (DMs and groups, on MLS). We start from the data, not the channel. Each kind of chat data is described by who may read it, who may write it, and how long it must live. Those requirements group it into 12 storage kinds. A channel such as GitHub is then just a **provider**: it implements those kinds and never sees plaintext or makes a security decision. So the same protocol can later run over another channel.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/storage-map-dark.png">
+  <img alt="Map of the 12 storage kinds: device-only stores, the public directory, members-only stores, server-enforced stores, personal stores and out-of-band checks, with arrows for what a device writes or reads" src="docs/images/storage-map-light.png">
+</picture>
+
+| # | Kind | Who reads / writes | For |
+| --- | --- | --- | --- |
+| 1 | Secure keystore | this device | root and device private keys, decrypted cache |
+| 2 | Ephemeral key store | this device | one-time and ratchet keys, deleted after use, never backed up |
+| 3 | Public directory | anyone / owner | identity key, signed device list, profile |
+| 4 | Claim-once store *(build option)* | taker / owner | one-time KeyPackages for adding someone who is offline |
+| 5 | Ordered log | members | commits, group policy, GroupInfo, in one agreed order |
+| 6 | Mailbox | members | messages, edits, reactions, receipts |
+| 7 | Blob store | members | attachments |
+| 8 | Drop box | members | Welcomes, invite tickets, join requests; deleted after read |
+| 9 | Backup vault | only you | root key backup |
+| 10 | Out of band | two people or devices | safety numbers, QR device link (no storage) |
+| 11 | Invite inbox | anyone writes, recipient reads | invite notices (server-enforced) |
+| 12 | Personal synced store | only you, all devices | contacts, chat list, read marks, settings, history backup |
+
+On GitHub each person has a public directory repo (3) and a private home repo (9, 12). Each chat is its own private repo (5 to 8), and repo collaborators act as a second fence. The existing Worker serves the invite inbox (11).
+
+Design: [docs/chat-storage.md](docs/chat-storage.md). Audit, known limits and the live GitHub run: [docs/chat-audit.md](docs/chat-audit.md).
+
 ## How the key scheme works
 
 One random 256-bit key K per account encrypts everything. The server only ever stores
@@ -163,5 +191,3 @@ npm run build         # dist/
 ```
 
 Consume it from another repo with `"keyhold": "github:DreamC0der-AI/keyhold"` (built on install).
-
-Chat design: [docs/chat-storage.md](docs/chat-storage.md). Audit and known limits: [docs/chat-audit.md](docs/chat-audit.md).
