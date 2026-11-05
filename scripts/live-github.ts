@@ -58,7 +58,8 @@ async function token(login: string): Promise<string> {
 /** Only plain data the step chose to report; never users, groups, tokens or keys. */
 function safeDetail(v: unknown): unknown {
   if (v === undefined || v === null || typeof v !== 'object') return v;
-  const text = JSON.stringify(v, (_k, x) => (x instanceof Uint8Array ? '[bytes]' : x));
+  let text: string;
+  try { text = JSON.stringify(v, (_k, x) => (x instanceof Uint8Array ? '[bytes]' : x)); } catch { return '[withheld]'; }
   if (/ghu_|ghp_|gho_|"tok"|"token"|signKey|"chat"/.test(text)) return '[withheld]';
   return JSON.parse(text);
 }
