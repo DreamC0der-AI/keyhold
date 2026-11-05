@@ -1,7 +1,7 @@
 {
   "name": "keyhold",
   "version": "0.1.0",
-  "description": "Login, key management and end-to-end encryption for web apps, as three separable modules.",
+  "description": "Login, key management and end-to-end encryption for web apps, including MLS group chat over pluggable storage.",
   "license": "UNLICENSED",
   "private": true,
   "type": "module",
@@ -33,6 +33,18 @@
     "./seed": {
       "types": "./dist/seed/index.d.ts",
       "default": "./dist/seed/index.js"
+    },
+    "./storage": {
+      "types": "./dist/storage/index.d.ts",
+      "default": "./dist/storage/index.js"
+    },
+    "./chat": {
+      "types": "./dist/chat/index.d.ts",
+      "default": "./dist/chat/index.js"
+    },
+    "./providers/github": {
+      "types": "./dist/providers/github/index.d.ts",
+      "default": "./dist/providers/github/index.js"
     }
   },
   "files": [
@@ -45,13 +57,15 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "prepare": "npm run build",
-    "test:browser": "node tests/browser/run.mjs"
+    "test:browser": "node tests/browser/run.mjs",
+    "build:live": "esbuild scripts/live-github.ts --bundle --platform=node --format=esm --outfile=scripts/live-github.mjs"
   },
   "dependencies": {
     "@noble/curves": "^2.4.0",
     "@noble/hashes": "^2.4.0",
     "@scure/bip39": "^2.4.0",
-    "hash-wasm": "^4.12.0"
+    "hash-wasm": "^4.12.0",
+    "ts-mls": "1.6.4"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",
@@ -59,5 +73,10 @@
     "typescript": "^5.9.3",
     "vitest": "^3.2.7",
     "esbuild": "^0.25.0"
+  },
+  "overrides": {
+    "ts-mls": {
+      "@noble/curves": "$@noble/curves"
+    }
   }
 }

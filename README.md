@@ -9,6 +9,9 @@ meet through small interfaces. Diorama Memory is the first user; nothing here is
 | Key management | `keyhold/keys`, `keyhold/keys/browser` | The notes key **K** and every way to unlock it: passkey (WebAuthn PRF), vault password (Argon2id), recovery code, this device, approval from another device by QR. | browser (envelope checks also on server) |
 | Encryption | `keyhold/crypto` | Seal and open data with K before it syncs. Takes a `CryptoKey`, nothing else. | anywhere with WebCrypto |
 | Seed phrases | `keyhold/seed` | BIP39 helpers shared by the seed login and seed recovery. | anywhere |
+| Storage model | `keyhold/storage` | Every chat data type as a requirement (who reads, who writes, how long it lives), the 12 storage kinds derived from them, provider interfaces and capabilities, and an in-memory provider. | anywhere |
+| Chat | `keyhold/chat` | End-to-end encrypted DMs and groups on MLS (RFC 9420): identity and directory, group policy and invite tickets, personal synced store, root key backup. Channel-free. | anywhere with WebCrypto |
+| GitHub provider | `keyhold/providers/github` | Stores each kind in GitHub repos and uses collaborator access as the channel fence. Never sees plaintext. | browser, Workers, Node |
 
 The interfaces between them:
 
@@ -17,6 +20,34 @@ The interfaces between them:
 - seed → auth and keys: `deriveSeedSecrets(phrase)` gives an `identitySeed` (Ed25519 login key) and a separate `recoverySecret` (wraps K). Neither reveals the other.
 
 The design these follow is in the "E2E encrypted notes with Apple and Google login" doc.
+
+## Encrypted chat: where every piece of data lives
+
+Keyhold also powers end-to-end encrypted chat (DMs and groups, on MLS). We start from the data, not the channel. Each kind of chat data is described by who may read it, who may write it, and how long it must live. Those requirements group it into 12 storage kinds. A channel such as GitHub is then just a **provider**: it implements those kinds and never sees plaintext or makes a security decision. So the same protocol can later run over another channel.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/storage-map-dark.png">
+  <img alt="Map of the 12 storage kinds: device-only stores, the public directory, members-only stores, server-enforced stores, personal stores and out-of-band checks, with arrows for what a device writes or reads" src="docs/images/storage-map-light.png">
+</picture>
+
+| # | Kind | Who reads / writes | For |
+| --- | --- | --- | --- |
+| 1 | Secure keystore | this device | root and device private keys, decrypted cache |
+| 2 | Ephemeral key store | this device | one-time and ratchet keys, deleted after use, never backed up |
+| 3 | Public directory | anyone / owner | identity key, signed device list, profile |
+| 4 | Claim-once store *(build option)* | taker / owner | one-time KeyPackages for adding someone who is offline |
+| 5 | Ordered log | members | commits, group policy, GroupInfo, in one agreed order |
+| 6 | Mailbox | members | messages, edits, reactions, receipts |
+| 7 | Blob store | members | attachments |
+| 8 | Drop box | members | Welcomes, invite tickets, join requests; deleted after read |
+| 9 | Backup vault | only you | root key backup |
+| 10 | Out of band | two people or devices | safety numbers, QR device link (no storage) |
+| 11 | Invite inbox | anyone writes, recipient reads | invite notices (server-enforced) |
+| 12 | Personal synced store | only you, all devices | contacts, chat list, read marks, settings, history backup |
+
+On GitHub each person has a public directory repo (3) and a private home repo (9, 12). Each chat is its own private repo (5 to 8), and repo collaborators act as a second fence. The existing Worker serves the invite inbox (11).
+
+Design: [docs/chat-storage.md](docs/chat-storage.md). Audit, known limits and the live GitHub run: [docs/chat-audit.md](docs/chat-audit.md).
 
 ## How the key scheme works
 

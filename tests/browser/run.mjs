@@ -39,6 +39,10 @@ try {
   const ok = r.prf === true && r.a.t === 'hi' && r.b.t === 'hi' && r.c.t === 'hi' && r.ext === false;
   console.log(ok ? 'browser check passed' : 'browser check FAILED', JSON.stringify(r));
   failed = !ok;
+  const c = await page.evaluate(() => window.runChat());
+  const chatOk = c.text === 'hello from the browser' && c.attachment === 300_000 && c.epoch >= 1;
+  console.log(chatOk ? 'browser chat check passed' : 'browser chat check FAILED', JSON.stringify(c));
+  failed = failed || !chatOk;
 } catch (e) {
   console.error(e);
   failed = true;
