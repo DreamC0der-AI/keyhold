@@ -55,13 +55,21 @@ async function token(login: string): Promise<string> {
   }
 }
 
+/** Only plain data the step chose to report; never users, groups, tokens or keys. */
+function safeDetail(v: unknown): unknown {
+  if (v === undefined || v === null || typeof v !== 'object') return v;
+  const text = JSON.stringify(v, (_k, x) => (x instanceof Uint8Array ? '[bytes]' : x));
+  if (/ghu_|ghp_|gho_|"tok"|"token"|signKey|"chat"/.test(text)) return '[withheld]';
+  return JSON.parse(text);
+}
+
 const report: { step: string; ok: boolean; detail?: unknown; ms: number }[] = [];
 async function step<T>(name: string, fn: () => Promise<T>): Promise<T | undefined> {
   const t0 = Date.now();
   try {
     const v = await fn();
-    report.push({ step: name, ok: true, detail: v && typeof v === 'object' && !Array.isArray(v) && v.constructor !== Object ? undefined : v, ms: Date.now() - t0 });
-    console.log(`PASS ${name}`, v === undefined || typeof v === 'object' && v && 'chat' in v ? '' : JSON.stringify(v)?.slice(0, 300));
+    report.push({ step: name, ok: true, detail: safeDetail(v), ms: Date.now() - t0 });
+    console.log(`PASS ${name}`, JSON.stringify(safeDetail(v))?.slice(0, 300) ?? '');
     return v;
   } catch (e) {
     report.push({ step: name, ok: false, detail: String((e as Error).stack ?? e), ms: Date.now() - t0 });
