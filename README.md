@@ -9,6 +9,9 @@ meet through small interfaces. Diorama Memory is the first user; nothing here is
 | Key management | `keyhold/keys`, `keyhold/keys/browser` | The notes key **K** and every way to unlock it: passkey (WebAuthn PRF), vault password (Argon2id), recovery code, this device, approval from another device by QR. | browser (envelope checks also on server) |
 | Encryption | `keyhold/crypto` | Seal and open data with K before it syncs. Takes a `CryptoKey`, nothing else. | anywhere with WebCrypto |
 | Seed phrases | `keyhold/seed` | BIP39 helpers shared by the seed login and seed recovery. | anywhere |
+| Storage model | `keyhold/storage` | Every chat data type as a requirement (who reads, who writes, how long it lives), the 12 storage kinds derived from them, provider interfaces and capabilities, and an in-memory provider. | anywhere |
+| Chat | `keyhold/chat` | End-to-end encrypted DMs and groups on MLS (RFC 9420): identity and directory, group policy and invite tickets, personal synced store, root key backup. Channel-free. | anywhere with WebCrypto |
+| GitHub provider | `keyhold/providers/github` | Stores each kind in GitHub repos and uses collaborator access as the channel fence. Never sees plaintext. | browser, Workers, Node |
 
 The interfaces between them:
 
@@ -160,3 +163,5 @@ npm run build         # dist/
 ```
 
 Consume it from another repo with `"keyhold": "github:DreamC0der-AI/keyhold"` (built on install).
+
+Chat design: [docs/chat-storage.md](docs/chat-storage.md). Audit and known limits: [docs/chat-audit.md](docs/chat-audit.md).
