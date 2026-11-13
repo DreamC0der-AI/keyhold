@@ -13,8 +13,20 @@ export const CONFIG = {
   mock: env.VITE_MOCK === '1',
   /** Repo names: the same for every user, so they reveal nothing. */
   directoryRepo: 'keyhold-id',
-  homeRepo: 'keyhold-home',
+  /**
+   * The private "home" repo (vault + personal store). New users create it themselves before
+   * installing the app, so GitHub's "Only select repositories" has something to select.
+   */
+  homeRepo: 'chat-home',
+  /** Home repo name used before 2026-11-13; kept for accounts that already have one. */
+  legacyHomeRepo: 'keyhold-home',
   chatPrefix: 'ghchat-',
 };
 
 export const installUrl = () => `https://github.com/apps/${CONFIG.appSlug}/installations/new`;
+export const newHomeRepoUrl = () =>
+  `https://github.com/new?${new URLSearchParams({
+    name: CONFIG.homeRepo,
+    visibility: 'private',
+    description: 'Private home of my end-to-end encrypted chat app (encrypted settings and key backup).',
+  })}`;

@@ -132,6 +132,20 @@ try {
   check((await alice2.page.locator('.box-row', { hasText: 'Added' }).count()) === 2, 'two devices listed');
   await alice2.page.screenshot({ path: `${SHOTS}/settings.png` });
 
+  // first run: no install yet -> guided steps -> continues by itself
+  const newbie = await person('newbie');
+  await newbie.page.getByText('Two quick steps on GitHub').waitFor();
+  check(await newbie.page.getByRole('link', { name: /Create chat-home on GitHub/ }).getAttribute('href').then((h) => h.includes('name=chat-home') && h.includes('visibility=private')), 'prefilled new-repo link');
+  await newbie.page.screenshot({ path: `${SHOTS}/install.png` });
+  await newbie.page.evaluate(() => fetch('/gh/mock/install', { method: 'POST', headers: { Authorization: 'Bearer tok-newbie' } }));
+  await newbie.page.getByRole('button', { name: 'Check now' }).click();
+  await newbie.page.getByRole('button', { name: 'Create identity' }).waitFor({ timeout: 20000 });
+  check(true, 'install detected, onboarding continues');
+  await newbie.page.getByRole('button', { name: 'Create identity' }).click();
+  await newbie.page.locator('.code-box').waitFor({ timeout: 30000 });
+  const homeOk = await newbie.page.evaluate(() => fetch('/gh/repos/newbie/chat-home/contents/vault/root', { headers: { Authorization: 'Bearer tok-newbie' } }).then((r) => r.status));
+  check(homeOk === 200, 'root key backup stored in chat-home');
+
   // mobile layout
   await bob.page.setViewportSize({ width: 390, height: 800 });
   await bob.page.screenshot({ path: `${SHOTS}/mobile-chat.png` });

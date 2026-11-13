@@ -13,6 +13,7 @@ import { MockGitHub } from '../../../tests/github-mock';
 const port = Number(process.argv[2] ?? 8787);
 const root = join(process.cwd(), 'dist-mock');
 const gh = new MockGitHub();
+const installed = new Set<string>();
 
 const cors = {
   'Access-Control-Allow-Origin': '*',
@@ -72,10 +73,16 @@ createServer(async (req, res) => {
         gh.repos.delete(k);
         return send(204);
       }
+      // Test hook: users named new* have no install until POST /gh/mock/install.
+      if (path === '/mock/install' && user && req.method === 'POST') {
+        installed.add(user);
+        return send(204);
+      }
       if (path === '/user/installations' && user) {
         const r = await gh.fetch(gh.api + rest, { method: 'GET', headers: { Authorization: auth! } });
         const data = (await r.json()) as { installations: { id: number; account: { login: string } }[] };
-        if (!data.installations.some((i) => i.account.login === user)) data.installations.push({ id: gh.users.get(user)!.id, account: { login: user } });
+        if (user.startsWith('new') && !installed.has(user)) data.installations = data.installations.filter((i) => i.account.login !== user);
+        else if (!data.installations.some((i) => i.account.login === user)) data.installations.push({ id: gh.users.get(user)!.id, account: { login: user } });
         return json(200, data);
       }
     }

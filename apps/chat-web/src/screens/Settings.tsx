@@ -59,7 +59,7 @@ export function Settings({ session }: { session: Session }) {
           <section className="box">
             <div className="box-header"><h3>Where your data lives</h3></div>
             <div className="box-row small">Public keys: <a className="mono" href={`https://github.com/${session.login}/keyhold-id`} target="_blank" rel="noreferrer">{session.login}/keyhold-id</a></div>
-            <div className="box-row small">Encrypted backup of your identity: <a className="mono" href={`https://github.com/${session.login}/keyhold-home`} target="_blank" rel="noreferrer">{session.login}/keyhold-home</a> (private)</div>
+            <div className="box-row small">Encrypted backup of your identity: <a className="mono" href={`https://github.com/${session.login}/${session.homeRepo}`} target="_blank" rel="noreferrer">{session.login}/{session.homeRepo}</a> (private)</div>
             <div className="box-row small">Chats: private <code>ghchat-…</code> repos, one per chat. Decrypted messages are kept only in this browser.</div>
           </section>
 
@@ -107,7 +107,7 @@ function ResetModal({ session, onClose }: { session: Session; onClose: () => voi
   const { busy, error, run } = useAction();
   return (
     <Modal title="Reset identity" onClose={onClose}>
-      <p>This deletes <code>{session.login}/keyhold-id</code> and <code>{session.login}/keyhold-home</code> and this browser's keys. Chat repos stay on GitHub but you can't read them any more.</p>
+      <p>This deletes <code>{session.login}/keyhold-id</code> and <code>{session.login}/{session.homeRepo}</code> and this browser's keys. Chat repos stay on GitHub but you can't read them any more.</p>
       <label className="field">Type <code>{session.login}</code> to confirm<input className="input" value={confirmText} onChange={(e) => setConfirm(e.target.value)} /></label>
       <ErrorFlash error={error} />
       <button className="btn danger block" disabled={busy || confirmText.trim().toLowerCase() !== session.login} onClick={() => run(async () => { await session.resetIdentity(); location.hash = ''; location.reload(); })}>

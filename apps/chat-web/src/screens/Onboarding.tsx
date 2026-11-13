@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { installUrl } from '../config';
+import { useEffect, useState } from 'react';
+import { CONFIG, installUrl, newHomeRepoUrl } from '../config';
 import type { Session } from '../lib/session';
 import { ErrorFlash, Icon, useAction } from '../ui';
 
@@ -18,18 +18,82 @@ function Frame({ title, children }: { title: string; children: React.ReactNode }
 }
 
 export function Install({ session }: { session: Session }) {
+  const home = CONFIG.homeRepo;
+  const [created, setCreated] = useState(() => localStorage.getItem('kh.homeCreated') === session.login);
+  const [opened, setOpened] = useState(false);
+
+  // Watch for the install: poll while this screen is up, and right away when the tab regains focus.
+  useEffect(() => {
+    let stop = false;
+    const check = () => { if (!stop) void session.pollInstall(); };
+    const t = setInterval(check, opened ? 4000 : 10000);
+    addEventListener('focus', check);
+    return () => {
+      stop = true;
+      clearInterval(t);
+      removeEventListener('focus', check);
+    };
+  }, [opened]);
+
+  const markCreated = () => {
+    localStorage.setItem('kh.homeCreated', session.login);
+    setCreated(true);
+  };
+
   return (
-    <Frame title="Install the app on your account">
+    <Frame title="Two quick steps on GitHub">
       <div className="box">
         <div className="box-body stack">
-          <p>Keyhold Chat keeps each chat in a private repo on your GitHub account. To create those repos it needs the app installed with <strong>Only select repositories</strong>.</p>
-          <ol className="steps">
-            <li>Open the install page and pick <strong>Only select repositories</strong>.</li>
-            <li>GitHub asks for at least one repo. Pick any one; the app never reads it.</li>
-            <li>Come back here. New chat repos are added to the install automatically.</li>
-          </ol>
-          <a className="btn primary block" href={installUrl()} target="_blank" rel="noreferrer">Install on GitHub</a>
-          <button className="btn block" onClick={() => session.recheckInstall()}>I've installed it</button>
+          <p>
+            Keyhold Chat only gets access to repos you pick. GitHub makes you pick at least one when you install an app, so first make
+            a private repo just for the app, then pick only that one.
+          </p>
+          {session.homeNotSelected && (
+            <div className="flash warn">
+              The app is installed, but <code>{home}</code> isn't one of its repos. Open the{' '}
+              <a href={session.installSettingsUrl()} target="_blank" rel="noreferrer">install settings</a>, add <code>{home}</code> under
+              Repository access, and save.
+            </div>
+          )}
+        </div>
+        <div className="box-row stack">
+          <div className="row" style={{ justifyContent: 'space-between' }}>
+            <strong>1. Create a private repo named <code>{home}</code></strong>
+            {created && <span className="label green">Done</span>}
+          </div>
+          <p className="small muted">
+            The name and "Private" are filled in for you. Just press <strong>Create repository</strong>. The app keeps your encrypted
+            settings and key backup there, so it isn't wasted.
+          </p>
+          <div className="row">
+            <a className={`btn${created ? '' : ' primary'}`} href={newHomeRepoUrl()} target="_blank" rel="noreferrer" onClick={markCreated}>
+              Create {home} on GitHub
+            </a>
+            {!created && <button className="btn link" onClick={markCreated}>I already have it</button>}
+          </div>
+        </div>
+        <div className="box-row stack">
+          <strong>2. Install the app on that repo only</strong>
+          <p className="small muted">
+            Choose <strong>Only select repositories</strong>, pick <code>{home}</code>, then <strong>Install</strong>. Don't choose "All
+            repositories". Chats you start later are added to the install by themselves.
+          </p>
+          <div className="row">
+            <a
+              className={`btn${created ? ' primary' : ''}`}
+              href={session.homeNotSelected ? session.installSettingsUrl() : installUrl()}
+              target="_blank"
+              rel="noreferrer"
+              onClick={() => setOpened(true)}
+            >
+              {session.homeNotSelected ? 'Open install settings' : 'Install on GitHub'}
+            </a>
+          </div>
+        </div>
+        <div className="box-row row small muted">
+          {opened ? <><span className="spinner" /> Waiting for GitHub. This page continues by itself once the app is installed.</> : 'This page continues by itself once the app is installed.'}
+          <span className="spacer" />
+          <button className="btn" onClick={() => session.recheckInstall()}>Check now</button>
         </div>
       </div>
       <p className="muted small center">Signed in as <strong>{session.login}</strong></p>
@@ -52,7 +116,7 @@ export function NewIdentity({ session }: { session: Session }) {
             <p>Your identity is a key made in this browser. It proves who you are to the people you chat with. Its private half never goes to GitHub unencrypted.</p>
             <ul className="steps muted">
               <li>The public key goes to a public repo <code>{session.login}/keyhold-id</code>, so others can find and check it.</li>
-              <li>An encrypted backup goes to your private repo <code>{session.login}/keyhold-home</code>.</li>
+              <li>An encrypted backup goes to your private repo <code>{session.login}/{session.homeRepo}</code>.</li>
               <li>You get a recovery code. It's the only way to open the backup on a new device.</li>
             </ul>
             <button className="btn primary block" disabled={busy} onClick={() => run(async () => setCode(await session.createIdentity()))}>
@@ -121,7 +185,7 @@ export function Restore({ session }: { session: Session }) {
             <>
               <p>You can start over with a new identity. Your contacts will see that your key changed, and your current chats stop working for you.</p>
               <label className="field">
-                Type <code>{session.login}</code> to delete <code>keyhold-id</code> and <code>keyhold-home</code>
+                Type <code>{session.login}</code> to delete <code>keyhold-id</code> and <code>{session.homeRepo}</code>
                 <input className="input" value={confirm} onChange={(e) => setConfirm(e.target.value)} />
               </label>
               <button

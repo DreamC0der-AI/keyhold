@@ -31,7 +31,7 @@ import {
 import type { AttachmentRef } from '@keyhold/chat/messages';
 import { generateRecoveryCode, parseRecoveryCode } from '@keyhold/keys/recovery';
 import { hkdfAesKey } from '@keyhold/util/hkdf';
-import { CONFIG } from '../config';
+import { CONFIG, installUrl } from '../config';
 import { currentToken, type AuthState } from './auth';
 import { Db, IdbPinStore, idbDevice } from './idb';
 
@@ -103,6 +103,10 @@ export class Session {
   error?: string;
   readonly address: string;
   readonly login: string;
+  homeRepo = CONFIG.homeRepo;
+  installationId?: number;
+  /** chat-home exists but the install doesn't include it. */
+  homeNotSelected = false;
   db!: Db;
   device!: DeviceStorage;
   provider!: StorageProvider & { client: { requests: number } };
@@ -172,18 +176,6 @@ export class Session {
     try {
       this.db = await Db.open(`keyhold-chat:${this.auth.id}`);
       this.device = idbDevice(this.db);
-      this.provider = githubProvider({
-        fetch: this.ghFetch as unknown as FetchFn,
-        token: 'set-per-request',
-        login: this.login,
-        workerUrl: CONFIG.worker,
-        apiBase: CONFIG.api,
-        directoryRepo: CONFIG.directoryRepo,
-        homeRepo: CONFIG.homeRepo,
-        chatPrefix: CONFIG.chatPrefix,
-        description: `End-to-end encrypted chat data. Only the members' chat app can read it. Open it at ${location.origin}`,
-      });
-      this.registry = new IdentityRegistry(this.provider.directory, new IdbPinStore(this.db));
       await this.decidePhase();
     } catch (e) {
       this.phase = 'error';
@@ -192,11 +184,31 @@ export class Session {
     this.bump();
   }
 
+  /** The provider needs the install: before it, GitHub hides every repo from the app. */
+  private async makeProvider() {
+    if (this.provider) return;
+    const legacy = await this.ghJson(`/repos/${this.login}/${CONFIG.legacyHomeRepo}`);
+    this.homeRepo = legacy.status === 200 ? CONFIG.legacyHomeRepo : CONFIG.homeRepo;
+    this.provider = githubProvider({
+      fetch: this.ghFetch as unknown as FetchFn,
+      token: 'set-per-request',
+      login: this.login,
+      workerUrl: CONFIG.worker,
+      apiBase: CONFIG.api,
+      directoryRepo: CONFIG.directoryRepo,
+      homeRepo: this.homeRepo,
+      chatPrefix: CONFIG.chatPrefix,
+      description: `End-to-end encrypted chat data. Only the members' chat app can read it. Open it at ${location.origin}`,
+    });
+    this.registry = new IdentityRegistry(this.provider.directory, new IdbPinStore(this.db));
+  }
+
   async decidePhase() {
     if (!(await this.isInstalled())) {
       this.phase = 'install';
       return;
     }
+    await this.makeProvider();
     this.identity = await loadDeviceIdentity(this.device);
     if (this.identity) {
       await this.openChat();
@@ -204,6 +216,19 @@ export class Session {
     }
     const dir = await verifyDirectory(await this.provider.directory.read(this.address));
     this.phase = dir ? 'restore' : 'new-identity';
+  }
+
+  /** Polled from the install screen: move on as soon as the install shows up. */
+  async pollInstall(): Promise<boolean> {
+    if (this.phase !== 'install') return true;
+    let ok = false;
+    try {
+      ok = await this.isInstalled();
+    } catch {
+      return false;
+    }
+    if (ok) await this.recheckInstall();
+    return ok;
   }
 
   async recheckInstall() {
@@ -219,9 +244,31 @@ export class Session {
   }
 
   async isInstalled(): Promise<boolean> {
-    const r = await this.ghJson<{ installations: { account: { login: string } }[] }>('/user/installations?per_page=100');
+    const r = await this.ghJson<{ installations: { id: number; account: { login: string } }[] }>('/user/installations?per_page=100');
     if (r.status !== 200) throw new Error(`Could not check the app installation (${r.status})`);
-    return (r.data?.installations ?? []).some((i) => i.account.login.toLowerCase() === this.login);
+    const mine = (r.data?.installations ?? []).find((i) => i.account.login.toLowerCase() === this.login);
+    this.installationId = mine?.id;
+    if (!mine) return false;
+    // The home repo must be one the app can open. If it exists but wasn't selected in the
+    // install, GitHub hides it from the app and the app can't create it either.
+    const home = await this.ghJson(`/repos/${this.login}/${CONFIG.homeRepo}`);
+    const legacy = home.status === 200 ? home : await this.ghJson(`/repos/${this.login}/${CONFIG.legacyHomeRepo}`);
+    if (home.status === 200 || legacy.status === 200) {
+      this.homeNotSelected = false;
+      return true;
+    }
+    const created = await this.ghFetch(`${CONFIG.api}/user/repos`, {
+      method: 'POST',
+      headers: { Accept: 'application/vnd.github+json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: CONFIG.homeRepo, private: true, auto_init: true, description: 'Private home of my end-to-end encrypted chat app (encrypted settings and key backup).' }),
+    });
+    this.homeNotSelected = created.status === 422;
+    return !this.homeNotSelected;
+  }
+
+  /** The install's settings page, where the user can add repos to it. */
+  installSettingsUrl() {
+    return this.installationId ? `https://github.com/settings/installations/${this.installationId}` : installUrl();
   }
 
   // ---- identity ----
@@ -312,7 +359,7 @@ export class Session {
   /** Testing aid: delete the identity repos so the account can start fresh. */
   async resetIdentity() {
     this.stop();
-    for (const name of [CONFIG.directoryRepo, CONFIG.homeRepo]) {
+    for (const name of [CONFIG.directoryRepo, this.homeRepo]) {
       const r = await this.ghFetch(`${CONFIG.api}/repos/${this.login}/${name}`, { method: 'DELETE', headers: { Accept: 'application/vnd.github+json' } });
       if (![204, 404].includes(r.status)) throw new Error(`Could not delete ${name} (${r.status})`);
     }
