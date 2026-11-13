@@ -71,8 +71,15 @@ export interface PendingInvite {
   /** The chat's repo, once it shows up among the repos we can open. */
   space?: string;
   from: string;
-  /** opening: invitation accepted, repo not visible yet. joining: trying now. waiting: asked the inviter's app to confirm our identity. */
-  status: 'opening' | 'joining' | 'waiting' | 'error';
+  /**
+   * invited: waiting for the user to accept or decline. joining: accepted, trying to join now.
+   * waiting: asked the inviter's app to confirm our identity. error: the last try failed.
+   */
+  status: 'invited' | 'joining' | 'waiting' | 'error';
+  /** The GitHub invitation id, while it isn't accepted yet. The inbox doesn't name the repo. */
+  pointer?: string;
+  /** The invite inbox entry that told us about it. */
+  noticeId?: string;
   error?: string;
   since: number;
   attempts: number;
@@ -95,6 +102,8 @@ const IDLE_POLL_MS = 20_000;
 const WARM_POLL_MS = 6_000;
 const HIDDEN_POLL_MS = 90_000;
 const INVITE_POLL_MS = 15_000;
+const FULL_SYNC_ACTIVE_MS = 12_000;
+const FULL_SYNC_WARM_MS = 30_000;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 export const loginFrom = (address: string) => {
@@ -142,6 +151,10 @@ export class Session {
   private lastInvites = 0;
   private lastSpaceScan = 0;
   private invites = new Map<string, PendingInvite>();
+  /** Chats the user declined, so they don't come back on the next scan. */
+  private declined = new Set<string>();
+  /** When each chat last had a full sync, as a fallback for GitHub's slow change check. */
+  private lastFullSync = new Map<string, number>();
   private kick?: () => void;
   private peers = new Map<string, Promise<PeerInfo>>();
 
@@ -402,6 +415,7 @@ export class Session {
       if (r) this.records.set(r.groupId, r);
     }
     for (const g of this.chat.groups.values()) this.record(g.id);
+    for (const k of await this.db.keys('kv', 'declined:')) this.declined.add(k.slice('declined:'.length));
     this.phase = 'ready';
     void this.loop();
   }
@@ -694,50 +708,63 @@ export class Session {
     this.bump();
   }
 
-  /** Accept GitHub invitations from the inbox, then join any space with a ticket for us. */
+  /**
+   * Collect invitations: inbox notices (GitHub invitations not accepted yet) and repos of other
+   * people we can already open. Both wait for the user to accept. Our own repos (another of our
+   * devices made the chat) are joined right away. Then join the accepted ones.
+   */
   async checkInvites(force = false) {
     const p = this.provider;
     const chat = this.chat!;
     const now = Date.now();
+    const known = () => new Set([...chat.groups.values()].map((g) => g.space));
     let notices: Awaited<ReturnType<typeof p.inviteInbox.list>> = [];
     try {
       notices = await p.inviteInbox.list();
     } catch (e) {
       this.lastPollError = describeError(e);
     }
+    let have = known();
+    // The inbox names who invited us but not the repo (the Worker keeps no repo names), so a
+    // notice stands alone until it is accepted and the repo becomes visible.
     for (const n of notices) {
-      try {
-        await p.channel.acceptGrant(n.pointer);
-        await p.inviteInbox.delete(n.id);
-        // The inbox only says who invited us, not which repo; show it until the repo turns up.
-        const key = `notice:${n.id}`;
-        if (!this.invites.has(key)) this.invites.set(key, { key, from: n.from, status: 'opening', since: now, attempts: 0, nextTry: 0 });
-      } catch (e) {
-        this.lastPollError = describeError(e);
-      }
+      const key = `notice:${n.id}`;
+      if (this.invites.has(key)) continue;
+      this.invites.set(key, { key, from: n.from, status: 'invited', pointer: n.pointer, noticeId: n.id, since: now, attempts: 0, nextTry: 0 });
     }
-    // Listing every repo the app can see costs a few requests: do it when an invite came in,
-    // when asked, while something is pending, or once a minute.
+    // Listing every repo the app can see costs a few requests: do it when asked, while something
+    // is pending, or once a minute.
     const scanEvery = this.invites.size ? 15_000 : 60_000;
-    if (force || notices.length || now - this.lastSpaceScan >= scanEvery) {
+    if (force || now - this.lastSpaceScan >= scanEvery) {
       this.lastSpaceScan = now;
-      const known = new Set([...chat.groups.values()].map((g) => g.space));
+      have = known();
       for (const space of await p.channel.listSpaces()) {
-        if (known.has(space) || this.invites.has(space)) continue;
-        const from = toAddress(space.split('/')[0]!);
-        // A notice from the same person is this repo: replace it.
-        for (const [k, v] of this.invites) if (k.startsWith('notice:') && v.from === from) this.invites.delete(k);
-        this.invites.set(space, { key: space, space, from, status: 'joining', since: now, attempts: 0, nextTry: 0 });
+        if (have.has(space) || this.invites.has(space) || this.declined.has(space)) continue;
+        const owner = space.split('/')[0]!.toLowerCase();
+        const from = toAddress(owner);
+        // Accepted here: an accepted notice from the same person is this repo. Our own repo means
+        // another of our devices made the chat. Anything else was accepted outside this app
+        // (on github.com), so it still waits for Accept here.
+        let accepted = owner === this.login.toLowerCase();
+        for (const [k, v] of this.invites) {
+          if (k.startsWith('notice:') && v.status !== 'invited' && v.from === from) {
+            this.invites.delete(k);
+            accepted = true;
+            break;
+          }
+        }
+        this.invites.set(space, { key: space, space, from, status: accepted ? 'joining' : 'invited', since: now, attempts: 0, nextTry: 0 });
       }
-      // Notices whose repo never showed up go away after a few minutes.
-      for (const [k, v] of this.invites) if (k.startsWith('notice:') && now - v.since > 5 * 60_000) this.invites.delete(k);
+      // Accepted notices whose repo never showed up go away after a few minutes.
+      for (const [k, v] of this.invites) if (k.startsWith('notice:') && v.status !== 'invited' && now - v.since > 5 * 60_000) this.invites.delete(k);
     }
+    have = known();
     for (const inv of [...this.invites.values()]) {
-      if (!inv.space || inv.dismissed) continue;
-      if ([...chat.groups.values()].some((g) => g.space === inv.space)) {
+      if (inv.space && have.has(inv.space)) {
         this.invites.delete(inv.key);
         continue;
       }
+      if (!inv.space || inv.dismissed || inv.status === 'invited') continue;
       if (!force && now < inv.nextTry) continue;
       inv.status = 'joining';
       this.bump();
@@ -760,6 +787,43 @@ export class Session {
       inv.attempts++;
       inv.nextTry = Date.now() + Math.min(10_000 * 2 ** Math.min(inv.attempts - 1, 5), 3 * 60_000);
     }
+    this.bump();
+  }
+
+  /** The user accepted: accept the GitHub invitation, then join the chat. */
+  async acceptInvite(key: string) {
+    const inv = this.invites.get(key);
+    if (!inv || inv.status !== 'invited') return;
+    const p = this.provider;
+    if (inv.pointer) await p.channel.acceptGrant(inv.pointer);
+    if (inv.noticeId) await p.inviteInbox.delete(inv.noticeId).catch(() => {});
+    Object.assign(inv, { status: 'joining', pointer: undefined, noticeId: undefined, nextTry: 0, attempts: 0, since: Date.now() });
+    this.bump();
+    await this.checkInvites(true);
+  }
+
+  /** The user declined: turn down the GitHub invitation (or leave the repo) and forget the chat. */
+  async declineInvite(key: string) {
+    const inv = this.invites.get(key);
+    if (!inv) return;
+    const p = this.provider;
+    if (inv.pointer) {
+      const id = inv.pointer.split('#').pop()!;
+      // The app's user token may not be allowed to decline; then the invitation simply expires
+      // on GitHub after 7 days, and nothing joins since it was never accepted.
+      const r = await this.ghFetch(`${CONFIG.api}/user/repository_invitations/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      if (![204, 404, 410, 403].includes(r.status)) throw new Error(`Couldn't decline the invitation on GitHub (${r.status}).`);
+    } else if (inv.space) {
+      // Already a collaborator (accepted on github.com): try to leave the repo. GitHub may not let
+      // the app do that, so the chat is hidden here either way.
+      await this.ghFetch(`${CONFIG.api}/repos/${inv.space}/collaborators/${encodeURIComponent(this.login)}`, { method: 'DELETE' }).catch(() => {});
+    }
+    if (inv.noticeId) await p.inviteInbox.delete(inv.noticeId).catch(() => {});
+    if (inv.space) {
+      this.declined.add(inv.space);
+      await this.db.put('kv', Date.now(), `declined:${inv.space}`);
+    }
+    this.invites.delete(key);
     this.bump();
   }
 
@@ -845,8 +909,15 @@ export class Session {
       const every = hidden ? HIDDEN_POLL_MS : g.id === this.activeGroup ? ACTIVE_POLL_MS : warm ? WARM_POLL_MS : IDLE_POLL_MS;
       if (now - (this.lastCheck.get(g.id) ?? 0) < every) continue;
       this.lastCheck.set(g.id, Date.now());
+      // GitHub's change check can lag up to a minute behind a push, so the open chat and busy
+      // chats also get a full sync every little while whatever it says.
+      const fallback = hidden ? Infinity : g.id === this.activeGroup ? FULL_SYNC_ACTIVE_MS : warm ? FULL_SYNC_WARM_MS : Infinity;
       try {
-        if (await this.headChanged(g.space)) await this.syncGroup(g);
+        const changed = await this.headChanged(g.space);
+        if (changed || now - (this.lastFullSync.get(g.id) ?? 0) >= fallback) {
+          this.lastFullSync.set(g.id, Date.now());
+          await this.syncGroup(g);
+        }
       } catch (e) {
         this.groupErrors.set(g.id, describeError(e));
       }

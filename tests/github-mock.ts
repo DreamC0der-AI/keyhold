@@ -119,6 +119,15 @@ export class MockGitHub {
       const slice = all.slice((page - 1) * 100, page * 100);
       return resp(200, { total_count: all.length, repositories: slice.map((r) => ({ name: r.name, full_name: `${r.owner}/${r.name}` })) });
     }
+    if ((m = path.match(/^\/user\/repository_invitations\/(\d+)$/)) && method === 'DELETE') {
+      const id = Number(m[1]);
+      for (const r of this.repos.values()) {
+        if (r.invitations.get(id) !== user) continue;
+        r.invitations.delete(id);
+        return resp(204, undefined);
+      }
+      return resp(404, { message: 'Not Found' });
+    }
     if ((m = path.match(/^\/user\/repository_invitations\/(\d+)$/)) && method === 'PATCH') {
       const id = Number(m[1]);
       for (const r of this.repos.values()) {
@@ -189,7 +198,8 @@ export class MockGitHub {
     }
     if ((m = rest.match(/^collaborators\/([^/]+)$/))) {
       const who = m[1]!.toLowerCase();
-      if (!isOwner) return resp(403, { message: 'Must have admin rights to Repository.' });
+      // A collaborator may remove themselves (leave the repo).
+      if (!isOwner && !(method === 'DELETE' && who === user)) return resp(403, { message: 'Must have admin rights to Repository.' });
       if (method === 'PUT') {
         if (!this.users.has(who)) return resp(404, {});
         if (r.collaborators.has(who) || who === r.owner) return resp(204, undefined);

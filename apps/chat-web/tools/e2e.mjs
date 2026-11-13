@@ -38,6 +38,11 @@ async function sendMsg(p, text) {
   await p.page.locator('#composer').fill(text);
   await p.page.locator('#composer').press('Enter');
 }
+async function accept(p, from, timeout = 45000) {
+  const row = p.page.locator('div.row', { hasText: `${from} invited you` }).filter({ has: p.page.getByRole('button', { name: 'Accept' }) }).first();
+  await row.waitFor({ timeout });
+  await row.getByRole('button', { name: 'Accept' }).click();
+}
 const bubble = (p, text) => p.page.locator('.bubble', { hasText: text }).first();
 
 try {
@@ -54,8 +59,13 @@ try {
   await alice.page.locator('.sys', { hasText: 'Invitation sent to @bob' }).waitFor({ timeout: 30000 });
   check(true, 'alice started DM');
 
+  await bob.page.getByText('alice invited you').waitFor({ timeout: 45000 });
+  await bob.page.waitForTimeout(3000);
+  check(!(await bob.page.locator('.chat-item', { hasText: 'alice' }).count()), 'bob sees an invitation and nothing joins before he accepts');
+  await bob.page.screenshot({ path: `${SHOTS}/invite-accept.png` });
+  await accept(bob, 'alice');
   await bob.page.locator('.chat-item', { hasText: 'alice' }).waitFor({ timeout: 45000 });
-  check(true, 'bob got the DM by himself');
+  check(true, 'bob accepted and joined the DM');
   await bob.page.locator('.chat-item', { hasText: 'alice' }).click();
   await sendMsg(bob, 'hi alice, it works');
   await bubble(alice, 'hi alice, it works').waitFor({ timeout: 30000 }).catch(() => {});
@@ -94,6 +104,7 @@ try {
   await alice.page.getByLabel('Invite people').fill('bob, carol');
   await alice.page.getByRole('button', { name: 'Create group' }).click();
   await alice.page.locator('.sys', { hasText: 'Invitation sent to @carol' }).waitFor({ timeout: 30000 });
+  for (const p of [bob, carol]) await accept(p, 'alice', 70000);
   for (const p of [bob, carol]) await p.page.locator('.chat-item', { hasText: 'Weekend hikers' }).waitFor({ timeout: 70000 });
   check(true, 'bob and carol got the group');
   await carol.page.locator('.chat-item', { hasText: 'Weekend hikers' }).click();
@@ -141,7 +152,8 @@ try {
   await alice.page.locator('.sys', { hasText: 'Invitation sent to @dave' }).waitFor({ timeout: 30000 });
   const t0 = Date.now();
   await setup(dave);
-  await dave.page.getByText('alice invited you').waitFor({ timeout: 30000 }).then(() => dave.page.screenshot({ path: `${SHOTS}/invite-pending.png` })).catch(() => log('note: invite row not seen'));
+  await accept(dave, 'alice', 60000);
+  await dave.page.screenshot({ path: `${SHOTS}/invite-pending.png` });
   await dave.page.locator('.chat-item', { hasText: 'alice' }).waitFor({ timeout: 90000 });
   check(true, `dave (no identity when invited) joined after ${Math.round((Date.now() - t0) / 1000)}s`);
   await dave.page.locator('.chat-item', { hasText: 'alice' }).click();
@@ -149,6 +161,21 @@ try {
   await alice.page.locator('.chat-item', { hasText: 'dave' }).click();
   await bubble(alice, 'dave here').waitFor({ timeout: 30000 });
   check(true, 'dave and alice can talk');
+
+  // decline: dave turns down a DM from carol, and it stays gone
+  await carol.page.getByRole('button', { name: 'New chat' }).first().click();
+  await carol.page.getByLabel('GitHub username').fill('dave');
+  await carol.page.getByRole('button', { name: 'Start chat' }).click();
+  await carol.page.locator('.sys', { hasText: 'Invitation sent to @dave' }).waitFor({ timeout: 30000 });
+  const decl = dave.page.locator('div.row', { hasText: 'carol invited you' }).filter({ has: dave.page.getByRole('button', { name: 'Decline' }) }).first();
+  await decl.waitFor({ timeout: 45000 });
+  await decl.getByRole('button', { name: 'Decline' }).click();
+  await dave.page.getByText('carol invited you').waitFor({ state: 'detached', timeout: 15000 });
+  const invs = await dave.page.evaluate(() => fetch('/gh/user/repository_invitations', { headers: { Authorization: 'Bearer tok-dave' } }).then((r) => r.json()).catch(() => []));
+  await dave.page.evaluate(() => { location.hash = '#/'; }); await dave.page.reload();
+  await dave.page.getByRole('heading', { name: /Pick a chat/ }).waitFor({ timeout: 20000 });
+  await dave.page.waitForTimeout(20000);
+  check(!(await dave.page.getByText('carol invited you').count()) && !(await dave.page.locator('.chat-item', { hasText: 'carol' }).count()), `dave declined carol's invitation and it stayed gone (open GitHub invitations: ${Array.isArray(invs) ? invs.length : '?'})`);
 
   // first run: no install yet -> guided steps -> continues by itself
   const newbie = await person('newbie');
