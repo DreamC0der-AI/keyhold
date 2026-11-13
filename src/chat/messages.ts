@@ -28,11 +28,16 @@ export type AppContent =
   /** Group name and avatar. Receivers accept it only from admins. */
   | { t: 'meta'; name?: string; avatar?: string }
   /** A non-owner admin asks the space manager's app to grant channel access. */
-  | { t: 'sys.grant'; address: string; expiresAt: number };
+  | { t: 'sys.grant'; address: string; expiresAt: number }
+  /**
+   * The space owner ends this room (Close chat). Receivers accept it only from the owner.
+   * `moved`: a duplicate DM room retired in favour of another room with the same person.
+   */
+  | { t: 'sys.close'; reason?: 'closed' | 'moved' };
 
 export type AppMessage = AppContent & { v: 1; id: string; ts: number };
 
-const TYPES = new Set(['text', 'edit', 'delete', 'react', 'receipt', 'attachment', 'meta', 'sys.grant']);
+const TYPES = new Set(['text', 'edit', 'delete', 'react', 'receipt', 'attachment', 'meta', 'sys.grant', 'sys.close']);
 
 export function newMessageId(): string {
   return toHex(randomBytes(12));

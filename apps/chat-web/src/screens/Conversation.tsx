@@ -1,51 +1,76 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { Group } from '@keyhold/chat/index';
 import type { AttachmentRef } from '@keyhold/chat/messages';
-import { describeError, loginFrom, type MsgRecord, type PeerInfo, type Session } from '../lib/session';
+import { describeError, loginFrom, type Convo, type MsgRecord, type PeerInfo, type Session } from '../lib/session';
+import { endedText } from './Home';
 import { Avatar, ErrorFlash, go, Icon, Modal, timeLabel, useAction } from '../ui';
 
 const clock = (ts: number) => new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 const msgTime = (ts: number) => (timeLabel(ts) === clock(ts) ? clock(ts) : `${timeLabel(ts)} ${clock(ts)}`);
 const EMOJI = ['👍', '❤️', '😂', '🎉', '👀'];
 
-export function Conversation({ session, group }: { session: Session; group: Group }) {
-  const [msgs, setMsgs] = useState<MsgRecord[]>([]);
+type Item = { kind: 'msg'; m: MsgRecord; group?: Group } | { kind: 'divider'; id: string; text: string };
+
+export function Conversation({ session, convo }: { session: Session; convo: Convo }) {
+  const [items, setItems] = useState<Item[]>([]);
   const [panel, setPanel] = useState(false);
   const [verify, setVerify] = useState<string>();
   const [peer, setPeer] = useState<PeerInfo>();
   const v = session.getVersion();
-  const dm = session.isDm(group);
-  const peerAddr = dm ? session.dmPeer(group) : undefined;
-  const title = session.title(group);
+  const dm = convo.dm;
+  const live = convo.live;
+  const group = live ?? convo.current;
+  const peerAddr = convo.peer;
+  const title = convo.title;
   const listRef = useRef<HTMLDivElement>(null);
   const atBottom = useRef(true);
+  const roomIds = convo.rooms.map((r) => r.groupId).join(',');
+  const { busy, error, run } = useAction();
 
   useEffect(() => {
-    let live = true;
-    void session.messages(group.id).then((m) => live && setMsgs(m));
+    let alive = true;
+    void Promise.all(convo.rooms.map((r) => session.messages(r.groupId))).then((lists) => {
+      if (!alive) return;
+      const out: Item[] = [];
+      convo.rooms.forEach((r, i) => {
+        const g = session.group(r.groupId);
+        for (const m of lists[i]!) out.push({ kind: 'msg', m, group: g });
+        const later = i < convo.rooms.length - 1;
+        if (r.ended) {
+          const when = new Date(r.ended.at).toLocaleDateString([], { day: 'numeric', month: 'short' });
+          out.push({ kind: 'divider', id: `end-${r.groupId}`, text: `${endedText(session, r.ended, dm)} on ${when}${later ? ' · new chat started' : ''}` });
+        } else if (later) out.push({ kind: 'divider', id: `end-${r.groupId}`, text: 'New chat started' });
+      });
+      setItems(out);
+    });
     return () => {
-      live = false;
+      alive = false;
     };
-  }, [v, group.id]);
+  }, [v, roomIds]);
 
   useEffect(() => {
     if (!peerAddr) return;
-    let live = true;
-    void session.peer(peerAddr).then((p) => live && setPeer(p));
+    let alive = true;
+    void session.peer(peerAddr).then((p) => alive && setPeer(p));
     return () => {
-      live = false;
+      alive = false;
     };
   }, [peerAddr, v]);
 
   useLayoutEffect(() => {
     const el = listRef.current;
     if (el && atBottom.current) el.scrollTop = el.scrollHeight;
-  }, [msgs.length, session.sending.get(group.id)?.length]);
+  }, [items.length, live && session.sending.get(live.id)?.length]);
 
-  const pending = session.pending(group);
-  const sending = session.sending.get(group.id) ?? [];
-  const err = session.groupErrors.get(group.id);
-  const joined = group.members().length > 1;
+  const liveRec = live ? session.records.get(live.id) : undefined;
+  const pending = live ? session.pending(live) : [];
+  const sending = live ? session.sending.get(live.id) ?? [] : [];
+  const err = group ? session.groupErrors.get(group.id) : undefined;
+  const joined = !!live && live.members().length > 1;
+  const peerLeft = !!live && dm && !!liveRec?.peerLeft && !joined;
+  const last = convo.rooms[convo.rooms.length - 1]!;
+  const space = group?.space ?? last.space;
+  const startNew = () => run(async () => go(`/c/${encodeURIComponent(await session.startDm(loginFrom(peerAddr!)))}`));
 
   return (
     <>
@@ -57,8 +82,8 @@ export function Conversation({ session, group }: { session: Session; group: Grou
             <strong style={{ fontSize: 16 }}>{title}</strong>
             <div className="small muted row" style={{ gap: 4 }}>
               {Icon.lock()} End-to-end encrypted
-              {!dm && <> · {group.members().length} {group.members().length === 1 ? 'member' : 'members'}</>}
-              <span className="hide-sm"> · <span className="mono">{group.space.split('/')[1]}</span></span>
+              {!dm && group && <> · {group.members().length} {group.members().length === 1 ? 'member' : 'members'}</>}
+              {space && <span className="hide-sm"> · <span className="mono">{space.split('/')[1]}</span></span>}
             </div>
           </div>
         </div>
@@ -74,6 +99,23 @@ export function Conversation({ session, group }: { session: Session; group: Grou
           <strong>{loginFrom(peer.address)}'s identity key changed.</strong> They may have a new device or reset their account, or someone may be impersonating them. <button className="btn link" onClick={() => setVerify(peer.address)}>Review</button>
         </div>
       )}
+      {peerLeft && (
+        <div className="flash warn banner" style={{ margin: '8px 16px 0', borderRadius: 6 }}>
+          <strong>{title} left this chat.</strong> You can't send messages here any more.{' '}
+          {session.isOwner(live!) && <button className="btn danger" disabled={busy} onClick={() => confirm(CLOSE_CONFIRM) && run(() => session.closeChat(live!))}>Close chat</button>}
+        </div>
+      )}
+      {!live && (
+        <div className="flash banner" style={{ margin: '8px 16px 0', borderRadius: 6 }}>
+          <strong>{group ? 'This chat is no longer available.' : `${last.ended ? endedText(session, last.ended, dm) : 'This chat has ended'}.`}</strong>{' '}
+          {group ? "GitHub doesn't let you open it right now. If access comes back, it carries on. " : 'Your copy of the messages stays here until you delete it. '}
+          <span className="row" style={{ marginTop: 6 }}>
+            {dm && peerAddr && !session.blocked.has(peerAddr) && <button className="btn primary" disabled={busy} onClick={startNew}>Start a new chat with {title}</button>}
+            <button className="btn" disabled={busy} onClick={() => confirm(DELETE_CONFIRM(dm ? title : undefined)) && run(async () => { await session.deleteHistory(convo.key); go('/'); })}>Delete chat</button>
+          </span>
+        </div>
+      )}
+      <ErrorFlash error={error} />
       <div className="convo-body">
         <div
           className="messages"
@@ -83,7 +125,9 @@ export function Conversation({ session, group }: { session: Session; group: Grou
             atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
           }}
         >
-          {msgs.map((m) => <Message key={m.id} m={m} session={session} group={group} showAuthor={!dm} />)}
+          {items.map((it) => it.kind === 'divider'
+            ? <div key={it.id} className="sys divider">{it.text}</div>
+            : <Message key={`${it.m.groupId}/${it.m.id}`} m={it.m} session={session} group={it.group} showAuthor={!dm} />)}
           {sending.map((p) => (
             <div key={p.id} className="msg mine">
               <div className="col">
@@ -92,19 +136,27 @@ export function Conversation({ session, group }: { session: Session; group: Grou
               </div>
             </div>
           ))}
-          {!joined && pending.length > 0 && (
+          {live && !joined && !peerLeft && pending.length > 0 && (
             <div className="sys">Waiting for {pending.map((a) => '@' + loginFrom(a)).join(', ')} to accept. You can send messages once someone has joined.</div>
           )}
         </div>
         {panel && (
-          <Details session={session} group={group} onClose={() => setPanel(false)} onVerify={setVerify} />
+          <Details session={session} convo={convo} group={group} onClose={() => setPanel(false)} onVerify={setVerify} />
         )}
       </div>
-      <Composer session={session} group={group} disabledReason={!group.active ? 'You are no longer a member of this chat.' : !joined ? 'Waiting for the other person to join…' : undefined} error={err} />
+      {live ? (
+        <Composer session={session} group={live} disabledReason={peerLeft ? `${title} left this chat` : !joined ? 'Waiting for the other person to join…' : undefined} error={err} />
+      ) : (
+        <div className="composer"><div className="composer-foot"><span>This chat has ended. Nothing can be sent here.</span></div></div>
+      )}
       {verify && <VerifyModal session={session} address={verify} onClose={() => setVerify(undefined)} />}
     </>
   );
 }
+
+const CLOSE_CONFIRM = 'Close this chat? It ends for everyone and its repo is deleted from GitHub. Everyone keeps the messages their app has, unless they delete them.';
+const QUIT_CONFIRM = 'Quit this chat? You stop receiving messages. Your copy of the history stays here until you delete it.';
+const DELETE_CONFIRM = (peer?: string) => `Delete this chat's messages from this browser? ${peer ?? 'The other members'} keep${peer ? 's' : ''} their copy.`;
 
 function TrustBadge({ peer, onClick }: { peer: PeerInfo; onClick: () => void }) {
   if (peer.status === 'none') return <span className="label">No identity yet</span>;
@@ -117,7 +169,7 @@ function TrustBadge({ peer, onClick }: { peer: PeerInfo; onClick: () => void }) 
   );
 }
 
-function Message({ m, session, group, showAuthor }: { m: MsgRecord; session: Session; group: Group; showAuthor: boolean }) {
+function Message({ m, session, group, showAuthor }: { m: MsgRecord; session: Session; group?: Group; showAuthor: boolean }) {
   if (m.kind === 'system') return <div className="sys">{m.body}</div>;
   const who = loginFrom(m.from);
   const reactions = Object.entries(m.reactions ?? {});
@@ -128,12 +180,12 @@ function Message({ m, session, group, showAuthor }: { m: MsgRecord; session: Ses
       <div className="col">
         {showAuthor && !m.mine && <span className="small muted">{who}</span>}
         <div className={`bubble${m.deleted ? ' deleted' : ''}`}>
-          {m.deleted ? 'Message deleted' : m.kind === 'attachment' && m.file ? <FileView session={session} group={group} file={m.file} caption={m.caption} /> : m.body}
+          {m.deleted ? 'Message deleted' : m.kind === 'attachment' && m.file ? (group ? <FileView session={session} group={group} file={m.file} caption={m.caption} /> : <span className="muted">📎 {m.file.name ?? 'file'} (no longer available)</span>) : m.body}
         </div>
         {reactions.length > 0 && (
           <div className="reactions">
             {reactions.map(([e, who]) => (
-              <button key={e} className={`reaction${who.includes(session.address) ? ' me' : ''}`} title={who.map(loginFrom).join(', ')} onClick={() => act(() => session.react(group, m.id, e))}>
+              <button key={e} className={`reaction${who.includes(session.address) ? ' me' : ''}`} title={who.map(loginFrom).join(', ')} disabled={!group?.active} onClick={() => group && act(() => session.react(group, m.id, e))}>
                 {e} {who.length}
               </button>
             ))}
@@ -142,7 +194,7 @@ function Message({ m, session, group, showAuthor }: { m: MsgRecord; session: Ses
         <span className="msg-meta">
           {msgTime(m.ts)}
           {m.edited && ' · edited'}
-          {!m.deleted && group.active && (
+          {!m.deleted && group?.active && (
             <span className="msg-actions">
               {EMOJI.map((e) => (
                 <button key={e} onClick={() => act(() => session.react(group, m.id, e))} aria-label={`React ${e}`}>{e}</button>
@@ -252,15 +304,18 @@ function Composer({ session, group, disabledReason, error }: { session: Session;
   );
 }
 
-function Details({ session, group, onClose, onVerify }: { session: Session; group: Group; onClose: () => void; onVerify: (a: string) => void }) {
-  const dm = session.isDm(group);
-  const members = group.members();
-  const policy = group.policy;
-  const iAmAdmin = policy.admins.includes(session.identity!.fingerprint);
-  const pending = session.pending(group);
+function Details({ session, convo, group, onClose, onVerify }: { session: Session; convo: Convo; group?: Group; onClose: () => void; onVerify: (a: string) => void }) {
+  const dm = convo.dm;
+  const members = group?.members() ?? [];
+  const iAmAdmin = !!group && group.policy.admins.includes(session.identity!.fingerprint);
+  const live = convo.live;
+  const pending = live ? session.pending(live) : [];
   const [invite, setInvite] = useState('');
-  const [name, setName] = useState(group.name ?? '');
+  const [name, setName] = useState(group?.name ?? '');
   const { busy, error, run } = useAction();
+  const peer = convo.peer;
+  const blocked = !!peer && session.blocked.has(peer);
+  const owner = !!live && session.isOwner(live);
   return (
     <aside className="panel" aria-label="Chat details">
       <div className="row" style={{ justifyContent: 'space-between' }}>
@@ -268,10 +323,10 @@ function Details({ session, group, onClose, onVerify }: { session: Session; grou
         <button className="btn icon" onClick={onClose} aria-label="Close panel">{Icon.close()}</button>
       </div>
       <ErrorFlash error={error} />
-      {!dm && iAmAdmin && group.active && (
-        <form className="stack" style={{ gap: 6 }} onSubmit={(e) => { e.preventDefault(); void run(() => session.rename(group, name.trim())); }}>
+      {!dm && iAmAdmin && live && (
+        <form className="stack" style={{ gap: 6 }} onSubmit={(e) => { e.preventDefault(); void run(() => session.rename(live, name.trim())); }}>
           <label className="field">Group name<input className="input" value={name} onChange={(e) => setName(e.target.value)} /></label>
-          <button className="btn" disabled={busy || !name.trim() || name.trim() === group.name}>Rename</button>
+          <button className="btn" disabled={busy || !name.trim() || name.trim() === live.name}>Rename</button>
         </form>
       )}
       <div>
@@ -289,8 +344,8 @@ function Details({ session, group, onClose, onVerify }: { session: Session; grou
                 <div className="small muted">{m.devices.length} {m.devices.length === 1 ? 'device' : 'devices'}</div>
               </div>
               {!me && <button className="btn link small" onClick={() => onVerify(m.address)}>Verify</button>}
-              {!me && !dm && iAmAdmin && group.active && (
-                <button className="btn danger" disabled={busy} onClick={() => confirm(`Remove ${login} from the group? Keys rotate right away.`) && run(() => session.removeMember(group, m.fingerprint))}>Remove</button>
+              {!me && !dm && iAmAdmin && live && (
+                <button className="btn danger" disabled={busy} onClick={() => confirm(`Remove ${login} from the group? Keys rotate right away.`) && run(() => session.removeMember(live, m.fingerprint))}>Remove</button>
               )}
             </div>
           );
@@ -302,23 +357,39 @@ function Details({ session, group, onClose, onVerify }: { session: Session; grou
           </div>
         ))}
       </div>
-      {!dm && iAmAdmin && group.active && (
-        <form className="stack" style={{ gap: 6 }} onSubmit={(e) => { e.preventDefault(); void run(async () => { await session.invite(group, invite); setInvite(''); }); }}>
+      {!dm && iAmAdmin && live && (
+        <form className="stack" style={{ gap: 6 }} onSubmit={(e) => { e.preventDefault(); void run(async () => { await session.invite(live, invite); setInvite(''); }); }}>
           <label className="field">Invite someone<input className="input" value={invite} onChange={(e) => setInvite(e.target.value)} placeholder="GitHub username" autoComplete="off" /></label>
           <button className="btn primary" disabled={busy || !invite.trim()}>{busy ? <span className="spinner" /> : 'Invite'}</button>
         </form>
       )}
-      <div className="stack small muted" style={{ gap: 6 }}>
-        <span>Stored in <a href={`https://github.com/${group.space}`} target="_blank" rel="noreferrer" className="mono">{group.space}</a>. The files there are ciphertext.</span>
-        <span>Key epoch {String(group.epoch)}. Keys rotate every 7 days or 100 messages, and whenever someone leaves.</span>
-      </div>
-      {group.active ? (
-        <button className="btn danger" disabled={busy} onClick={() => confirm(dm ? 'Leave this chat? You will not be able to read it any more.' : 'Leave this group?') && run(async () => { await session.leave(group); go('/'); })}>
-          Leave {dm ? 'chat' : 'group'}
-        </button>
-      ) : (
-        <button className="btn" onClick={() => run(async () => { await session.hide(group); go('/'); })}>Remove from list</button>
+      {group && (
+        <div className="stack small muted" style={{ gap: 6 }}>
+          <span>Stored in <a href={`https://github.com/${group.space}`} target="_blank" rel="noreferrer" className="mono">{group.space}</a>. The files there are ciphertext.</span>
+          <span>Key epoch {String(group.epoch)}. Keys rotate every 7 days or 100 messages, and whenever someone leaves.</span>
+        </div>
       )}
+      <div className="stack" style={{ gap: 6 }}>
+        {live && owner && (
+          <>
+            <button className="btn danger" disabled={busy} onClick={() => confirm(CLOSE_CONFIRM) && run(() => session.closeChat(live))}>Close chat</button>
+            <span className="small muted">Ends it for everyone and deletes its repo. You started it, so only you can close it.</span>
+          </>
+        )}
+        {live && !owner && (
+          <>
+            <button className="btn danger" disabled={busy} onClick={() => confirm(QUIT_CONFIRM) && run(() => session.quitChat(live))}>Quit chat</button>
+            <span className="small muted">You leave; {dm ? `${convo.title} keeps` : 'the others keep'} the chat.</span>
+          </>
+        )}
+        <button className="btn" disabled={busy} onClick={() => confirm(DELETE_CONFIRM(dm ? convo.title : undefined)) && run(async () => { await session.deleteHistory(convo.key); if (!live) go('/'); })}>Delete chat</button>
+        <span className="small muted">Deletes the messages in this browser only.{live ? ' The chat stays open.' : ''}</span>
+        {dm && peer && (blocked ? (
+          <button className="btn" disabled={busy} onClick={() => run(() => session.unblock(peer))}>Unblock {convo.title}</button>
+        ) : (
+          <button className="btn danger" disabled={busy} onClick={() => confirm(`Block ${convo.title}? ${live ? (owner ? 'This chat is closed, and ' : 'You quit this chat, and ') : ''}their invitations are turned down without asking you.`) && run(() => session.block(peer))}>Block {convo.title}</button>
+        ))}
+      </div>
     </aside>
   );
 }

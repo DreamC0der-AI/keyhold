@@ -19,6 +19,7 @@ async function person(login) {
   await page.goto(BASE);
   await page.getByLabel('Test account').fill(login);
   await page.getByRole('button', { name: /Sign in/ }).click();
+  page.on('dialog', (d) => d.accept());
   const p = { ctx, page, login };
   people.push(p);
   return p;
@@ -117,10 +118,9 @@ try {
 
   // remove carol
   await alice.page.getByRole('button', { name: /Members/ }).click();
-  alice.page.once('dialog', (d) => d.accept());
   await alice.page.locator('.member', { hasText: 'carol' }).getByRole('button', { name: 'Remove' }).click();
   await alice.page.locator('.sys', { hasText: '@carol left' }).waitFor({ timeout: 30000 }).catch(() => {});
-  await carol.page.locator('.sys', { hasText: /You were removed|no longer gives you access/ }).waitFor({ timeout: 45000 });
+  await carol.page.locator('.sys, .flash', { hasText: /You were removed|no longer available/ }).first().waitFor({ timeout: 45000 });
   await carol.page.screenshot({ path: `${SHOTS}/carol-removed.png` });
   check(true, 'carol removed and told');
   await alice.page.screenshot({ path: `${SHOTS}/group-alice-panel.png` });
@@ -176,6 +176,90 @@ try {
   await dave.page.getByRole('heading', { name: /Pick a chat/ }).waitFor({ timeout: 20000 });
   await dave.page.waitForTimeout(20000);
   check(!(await dave.page.getByText('carol invited you').count()) && !(await dave.page.locator('.chat-item', { hasText: 'carol' }).count()), `dave declined carol's invitation and it stayed gone (open GitHub invitations: ${Array.isArray(invs) ? invs.length : '?'})`);
+
+  const openChat = async (p, name) => {
+    await p.page.locator('.chat-item', { hasText: name }).first().click();
+    await p.page.waitForTimeout(300);
+  };
+  const details = async (p) => {
+    if (!(await p.page.locator('aside.panel').count())) await p.page.getByRole('button', { name: /Details|Members/ }).click();
+  };
+  const count = (p, name) => p.page.locator('.chat-item .name').getByText(name, { exact: true }).count();
+
+  // Delete chat: bob clears his copy of the DM with alice; the chat stays live
+  await openChat(bob, 'alice');
+  await details(bob);
+  await bob.page.locator('aside.panel').getByRole('button', { name: 'Delete chat' }).click();
+  await bubble(bob, 'hi alice, it works').waitFor({ state: 'detached', timeout: 10000 });
+  await openChat(alice, 'bob');
+  await sendMsg(alice, 'after the clear');
+  await bubble(bob, 'after the clear').waitFor({ timeout: 30000 });
+  check(!(await bubble(bob, 'hello bob').count()), 'bob deleted his history, the chat stayed live and new messages arrive');
+  check(await bubble(alice, 'hi alice, it works').count() > 0, 'alice kept her copy');
+
+  // Close: alice (owner) closes the DM; bob learns why, keeps his copy, and starts a new one
+  await details(alice);
+  await alice.page.locator('aside.panel').getByRole('button', { name: 'Close chat' }).click();
+  await alice.page.locator('.sys.divider', { hasText: 'You closed this chat' }).waitFor({ timeout: 30000 });
+  await bob.page.locator('.sys.divider', { hasText: '@alice closed this chat' }).waitFor({ timeout: 45000 });
+  check(await bubble(bob, 'after the clear').count() > 0 && (await bob.page.locator('#composer').count()) === 0, 'bob sees "@alice closed this chat", keeps his copy, and can\'t send');
+  await bob.page.screenshot({ path: `${SHOTS}/closed-bob.png` });
+  await bob.page.getByRole('button', { name: 'Start a new chat with alice' }).click();
+  await accept(alice, 'bob', 60000);
+  await bob.page.locator('.sys', { hasText: '@alice joined' }).waitFor({ timeout: 60000 });
+  await sendMsg(bob, 'new room, same chat');
+  await openChat(alice, 'bob');
+  await bubble(alice, 'new room, same chat').waitFor({ timeout: 30000 });
+  check((await count(alice, 'bob')) === 1 && (await count(bob, 'alice')) === 1, 'one chat-list entry per person after re-creation');
+  check(await alice.page.locator('.sys.divider', { hasText: 'new chat started' }).count() > 0 && (await bubble(alice, 'after the clear').count()) > 0, 'old history above a divider, then the new room');
+  await alice.page.screenshot({ path: `${SHOTS}/recreated-alice.png` });
+
+  // Quit: dave (not the owner) quits; alice sees he left, can't send, and closes
+  await openChat(dave, 'alice');
+  await details(dave);
+  await dave.page.locator('aside.panel').getByRole('button', { name: 'Quit chat' }).click();
+  await dave.page.locator('.sys.divider', { hasText: 'You left this chat' }).waitFor({ timeout: 30000 });
+  await openChat(alice, 'dave');
+  await alice.page.getByText('dave left this chat.').waitFor({ timeout: 60000 });
+  check(await alice.page.locator('#composer').isDisabled(), 'alice sees "dave left", sending is off');
+  await alice.page.locator('.banner').getByRole('button', { name: 'Close chat' }).click();
+  await alice.page.locator('.sys.divider', { hasText: 'You closed this chat' }).waitFor({ timeout: 30000 });
+  check(true, 'alice closed the chat dave quit');
+
+  // Block: dave blocks alice; her next invitation is turned down without asking
+  await details(dave);
+  await dave.page.locator('aside.panel').getByRole('button', { name: 'Block alice' }).click();
+  await dave.page.locator('aside.panel').getByRole('button', { name: 'Unblock alice' }).waitFor();
+  await alice.page.getByRole('button', { name: 'Start a new chat with dave' }).click();
+  await alice.page.locator('.sys', { hasText: 'Invitation sent to @dave' }).waitFor({ timeout: 30000 });
+  await dave.page.waitForTimeout(25000);
+  check(!(await dave.page.getByText('alice invited you').count()), 'blocked person\'s invitation never shows');
+
+  // Both start a DM with each other at once: the apps settle on one room (rule 2)
+  for (const p of [bob, carol]) await p.page.getByRole('button', { name: 'New chat' }).first().click();
+  await bob.page.getByLabel('GitHub username').fill('carol');
+  await carol.page.getByLabel('GitHub username').fill('bob');
+  await Promise.all([bob.page.getByRole('button', { name: 'Start chat' }).click(), carol.page.getByRole('button', { name: 'Start chat' }).click()]);
+  const settled = async () => {
+    for (let i = 0; i < 40; i++) {
+      const ok = (await count(bob, 'carol')) === 1 && (await count(carol, 'bob')) === 1
+        && !(await bob.page.getByText('carol invited you').count()) && !(await carol.page.getByText('bob invited you').count());
+      const live = await Promise.all([bob, carol].map((p) => p.page.locator('#composer').isEnabled().catch(() => false)));
+      if (ok && live.every(Boolean)) return true;
+      await bob.page.waitForTimeout(3000);
+    }
+    for (const p of [bob, carol]) {
+      log(`state ${p.login}`, await count(p, p === bob ? 'carol' : 'bob'), JSON.stringify(await p.page.locator('.chat-list').innerText()));
+      await p.page.screenshot({ path: `${SHOTS}/race-${p.login}.png` });
+    }
+    return false;
+  };
+  check(await settled(), 'simultaneous DMs settle on one chat');
+  await openChat(bob, 'carol');
+  await openChat(carol, 'bob');
+  await sendMsg(carol, 'one room for us');
+  await bubble(bob, 'one room for us').waitFor({ timeout: 45000 });
+  check(true, 'messages flow in the surviving room');
 
   // first run: no install yet -> guided steps -> continues by itself
   const newbie = await person('newbie');

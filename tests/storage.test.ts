@@ -145,7 +145,8 @@ describe.each(providers)('storage conformance: %s', (_name, make) => {
     expect((await a.channel.members(s)).active.sort()).toEqual([w.addr('alice'), w.addr('bob')].sort());
     expect(await a.channel.revoke(s, w.addr('bob'))).toBe('done');
     await expect(b.orderedLog.read(s, 0)).rejects.toBeTruthy();
-    await expect(b.mailbox.post(s, bytes('x'))).rejects.toBeTruthy();
+    // A gone repo or lost access is reported as such, not retried as a conflict.
+    await expect(b.mailbox.post(s, bytes('x'))).rejects.toMatchObject({ code: 'forbidden' });
   });
 
   it('mailbox (6), blobs (7), drop box (8)', async () => {

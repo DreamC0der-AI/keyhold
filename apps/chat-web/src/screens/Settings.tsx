@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { DeviceCertificate } from '@keyhold/chat/identity';
 import { signOut } from '../lib/auth';
-import type { Session } from '../lib/session';
+import { loginFrom, type Session } from '../lib/session';
 import { Avatar, ErrorFlash, Icon, Modal, useAction, useSession } from '../ui';
 
 export function Settings({ session }: { session: Session }) {
@@ -55,6 +55,19 @@ export function Settings({ session }: { session: Session }) {
               To use another browser or computer, sign in there and enter your recovery code. It joins your chats on its own; it can't read older messages. Revoking a lost device removes it from every chat the next time a member's app syncs.
             </div>
           </section>
+
+          {session.blocked.size > 0 && (
+            <section className="box">
+              <div className="box-header"><h3>Blocked</h3></div>
+              {[...session.blocked].map((a) => (
+                <div className="box-row row" key={a} style={{ justifyContent: 'space-between' }}>
+                  <span className="row" style={{ gap: 8 }}><Avatar name={loginFrom(a)} login={loginFrom(a)} size="sm" /> {loginFrom(a)}</span>
+                  <button className="btn" onClick={() => run(() => session.unblock(a))}>Unblock</button>
+                </div>
+              ))}
+              <div className="box-row small muted">Invitations from blocked people are turned down without asking you.</div>
+            </section>
+          )}
 
           <section className="box">
             <div className="box-header"><h3>Where your data lives</h3></div>

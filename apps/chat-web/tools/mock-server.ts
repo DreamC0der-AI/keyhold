@@ -14,6 +14,8 @@ const port = Number(process.argv[2] ?? 8787);
 const root = join(process.cwd(), 'dist-mock');
 const gh = new MockGitHub();
 const installed = new Set<string>();
+/** Worker closure notices: member login -> notices. */
+const closures = new Map<string, { id: string; from: string; from_id: number; tag: string; at: string }[]>();
 
 const cors = {
   'Access-Control-Allow-Origin': '*',
@@ -53,7 +55,10 @@ createServer(async (req, res) => {
     if (isGh) {
       if (path === '/user') return user ? json(200, { login: user, id: gh.users.get(user)!.id }) : json(401, {});
       let m = path.match(/^\/users\/([^/]+)$/);
-      if (m) return gh.users.has(m[1]!.toLowerCase()) ? json(200, { login: m[1], type: 'User' }) : json(404, { message: 'Not Found' });
+      if (m) {
+        const l = m[1]!.toLowerCase();
+        return gh.users.has(l) ? json(200, { login: m[1], id: gh.users.get(l)!.id, type: 'User' }) : json(404, { message: 'Not Found' });
+      }
       m = path.match(/^\/repos\/([^/]+)\/([^/]+)\/commits$/);
       if (m && req.method === 'GET') {
         const r = gh.repos.get(`${m[1]}/${m[2]}`.toLowerCase());
@@ -85,6 +90,23 @@ createServer(async (req, res) => {
         else if (!data.installations.some((i) => i.account.login === user)) data.installations.push({ id: gh.users.get(user)!.id, account: { login: user } });
         return json(200, data);
       }
+    }
+    if (!isGh && path === '/closures' && user) {
+      if (req.method === 'GET') return json(200, { closures: closures.get(user) ?? [] });
+      if (req.method === 'POST') {
+        const b = JSON.parse(body ?? '{}') as { to: string; tag: string };
+        const to = String(b.to).toLowerCase();
+        if (!gh.users.has(to)) return json(404, { error: 'no such user' });
+        const me = gh.users.get(user)!;
+        const entry = { id: `${me.id}:${b.tag}`, from: user, from_id: me.id, tag: b.tag, at: new Date().toISOString() };
+        closures.set(to, [...(closures.get(to) ?? []).filter((c) => c.id !== entry.id), entry]);
+        return json(201, { ok: true });
+      }
+    }
+    const cm = path.match(/^\/closures\/(.+)$/);
+    if (!isGh && cm && req.method === 'DELETE' && user) {
+      closures.set(user, (closures.get(user) ?? []).filter((c) => c.id !== cm[1]));
+      return json(200, { ok: true });
     }
     const r = await gh.fetch((isGh ? gh.api : gh.worker) + rest, { method: req.method, headers: auth ? { Authorization: auth } : {}, body });
     const text = await r.text();

@@ -1,30 +1,29 @@
 import { useEffect, useMemo, useState } from 'react';
-import type { Group } from '@keyhold/chat/index';
-import { loginFrom, type PendingInvite, type Session } from '../lib/session';
+import { loginFrom, type Convo, type PendingInvite, type Session } from '../lib/session';
 import { Avatar, ErrorFlash, go, Icon, Modal, timeLabel, useAction, useSession } from '../ui';
 import { Conversation } from './Conversation';
 
 export function Home({ session, route }: { session: Session; route: string }) {
   useSession(session);
   const chatId = route.startsWith('/c/') ? decodeURIComponent(route.slice(3)) : undefined;
-  const group = chatId ? session.group(chatId) : undefined;
+  const convo = chatId ? session.convo(chatId) : undefined;
   const [modal, setModal] = useState<'dm' | 'group'>();
   const [q, setQ] = useState('');
 
   useEffect(() => {
-    session.setActive(group?.id);
+    session.setActive(convo?.key);
     return () => session.setActive(undefined);
-  }, [group?.id]);
+  }, [convo?.key]);
 
-  const groups = session.groups();
-  const unread = groups.reduce((n, g) => n + (session.records.get(g.id)?.unread ?? 0), 0);
+  const convos = session.conversations();
+  const unread = convos.reduce((n, c) => n + c.unread, 0);
   useEffect(() => {
     document.title = unread ? `(${unread}) Keyhold Chat` : 'Keyhold Chat';
   }, [unread]);
 
   const shown = useMemo(
-    () => groups.filter((g) => !q || session.title(g).toLowerCase().includes(q.toLowerCase())),
-    [groups, q, session.getVersion()],
+    () => convos.filter((c) => !q || c.title.toLowerCase().includes(q.toLowerCase())),
+    [convos, q, session.getVersion()],
   );
 
   return (
@@ -34,13 +33,13 @@ export function Home({ session, route }: { session: Session; route: string }) {
         <nav className="crumbs" aria-label="Breadcrumb">
           <span className="hide-sm">{session.login}</span>
           <span className="muted hide-sm">/</span>
-          {group ? <><a href="#/">Chats</a><span className="muted">/</span><strong>{session.title(group)}</strong></> : <strong>Chats</strong>}
+          {convo ? <><a href="#/">Chats</a><span className="muted">/</span><strong>{convo.title}</strong></> : <strong>Chats</strong>}
         </nav>
         <span className="spacer" />
         <button className="btn icon" aria-label="New chat" title="New chat" onClick={() => setModal('dm')}>{Icon.plus()}</button>
         <a href="#/settings" aria-label="Account and devices" title="Account and devices"><Avatar name={session.login} login={session.login} /></a>
       </header>
-      <div className={`main${group ? ' has-chat' : ''}`}>
+      <div className={`main${convo ? ' has-chat' : ''}`}>
         <nav className="sidebar" aria-label="Chats">
           <div className="sidebar-head">
             <label className="sr" htmlFor="q">Search chats</label>
@@ -52,8 +51,8 @@ export function Home({ session, route }: { session: Session; route: string }) {
           </div>
           <ul className="chat-list">
             <Invites session={session} />
-            {shown.map((g) => <ChatRow key={g.id} session={session} g={g} active={g.id === group?.id} />)}
-            {!groups.length && !session.pendingInvites().length && (
+            {shown.map((c) => <ChatRow key={c.key} session={session} c={c} active={c.key === convo?.key} />)}
+            {!convos.length && !session.pendingInvites().length && (
               <li className="empty" style={{ padding: 32 }}>
                 <p>No chats yet.</p>
                 <button className="btn primary" onClick={() => setModal('dm')}>Start a chat</button>
@@ -64,8 +63,8 @@ export function Home({ session, route }: { session: Session; route: string }) {
           <StatusBar session={session} />
         </nav>
         <main className="content">
-          {group ? (
-            <Conversation key={group.id} session={session} group={group} />
+          {convo ? (
+            <Conversation key={convo.key} session={session} convo={convo} />
           ) : chatId ? (
             <div className="empty"><p>This chat isn't on this browser.</p><a href="#/">Back to chats</a></div>
           ) : (
@@ -83,33 +82,47 @@ export function Home({ session, route }: { session: Session; route: string }) {
   );
 }
 
-function ChatRow({ session, g, active }: { session: Session; g: Group; active: boolean }) {
-  const r = session.records.get(g.id);
-  const dm = session.isDm(g);
-  const title = session.title(g);
-  const pending = session.pending(g);
-  const peer = dm ? session.dmPeer(g) : undefined;
-  const waiting = dm && pending.length > 0;
-  const preview = !g.active ? 'You are no longer in this chat' : r?.lastText ?? (waiting ? `Waiting for ${title} to join` : 'No messages yet');
+function ChatRow({ session, c, active }: { session: Session; c: Convo; active: boolean }) {
+  const g = c.live ?? c.current;
+  const last = c.rooms[c.rooms.length - 1]!;
+  const pending = c.live ? session.pending(c.live) : [];
+  const waiting = c.dm && pending.length > 0;
+  const preview = c.lastText
+    ?? (!c.live ? (last.ended ? endedText(session, last.ended, c.dm) : 'This chat is no longer available')
+      : waiting ? `Waiting for ${c.title} to join` : 'No messages yet');
   return (
     <li>
-      <button className={`chat-item${active ? ' active' : ''}`} onClick={() => go(`/c/${encodeURIComponent(g.id)}`)}>
-        <Avatar name={title} login={peer ? loginFrom(peer) : undefined} square={!dm} />
+      <button className={`chat-item${active ? ' active' : ''}`} onClick={() => go(`/c/${encodeURIComponent(c.key)}`)}>
+        <Avatar name={c.title} login={c.peer ? loginFrom(c.peer) : undefined} square={!c.dm} />
         <span className="meta">
           <span className="name">
-            <span>{title}</span>
-            {!dm && <span className="label">{g.members().length}</span>}
+            <span>{c.title}</span>
+            {!c.dm && g && <span className="label">{g.members().length}</span>}
             {waiting && <span className="label">Invite sent</span>}
+            {!c.live && <span className="label">Ended</span>}
           </span>
           <span className="preview">{preview}</span>
         </span>
         <span className="right">
-          <span>{r ? timeLabel(r.lastTs) : ''}</span>
-          {!!r?.unread && <span className="counter">{r.unread}</span>}
+          <span>{timeLabel(c.lastTs)}</span>
+          {!!c.unread && <span className="counter">{c.unread}</span>}
         </span>
       </button>
     </li>
   );
+}
+
+/** One line on how a room ended, for the chat list and the divider in the timeline. */
+export function endedText(session: Session, e: NonNullable<import('../lib/session').ChatRecord['ended']>, dm: boolean) {
+  const me = e.by === session.address;
+  const who = e.by ? `@${loginFrom(e.by)}` : 'Someone';
+  const what = dm ? 'this chat' : 'this group';
+  switch (e.how) {
+    case 'closed': return me ? `You closed ${what}` : `${who} closed ${what}`;
+    case 'moved': return 'Continued in a newer chat';
+    case 'quit': return `You left ${what}`;
+    case 'removed': return `You were removed from ${what}`;
+  }
 }
 
 function Invites({ session }: { session: Session }) {
@@ -174,6 +187,7 @@ function StatusBar({ session }: { session: Session }) {
 function NewDm({ session, onClose, onGroup }: { session: Session; onClose: () => void; onGroup: () => void }) {
   const [login, setLogin] = useState('');
   const { busy, error, run } = useAction();
+  const theirs = login.trim() ? session.inviteFrom(login) : undefined;
   return (
     <Modal title="New chat" onClose={onClose}>
       <form
@@ -181,9 +195,9 @@ function NewDm({ session, onClose, onGroup }: { session: Session; onClose: () =>
         onSubmit={(e) => {
           e.preventDefault();
           void run(async () => {
-            const g = await session.startDm(login);
+            const key = await session.startDm(login);
             onClose();
-            go(`/c/${encodeURIComponent(g.id)}`);
+            go(`/c/${encodeURIComponent(key)}`);
           });
         }}
       >
@@ -192,6 +206,12 @@ function NewDm({ session, onClose, onGroup }: { session: Session; onClose: () =>
           <input className="input" value={login} onChange={(e) => setLogin(e.target.value)} placeholder="octocat" autoFocus autoComplete="off" />
           <span className="hint">They get a GitHub repo invitation. The chat opens for them when they sign in here. Not on Keyhold Chat yet? Send them this page's address.</span>
         </label>
+        {theirs && (
+          <div className="flash">
+            <strong>{loginFrom(theirs.from)}</strong> already invited you. Accept their invitation instead of starting a second chat.{' '}
+            <button type="button" className="btn primary" disabled={busy} onClick={() => run(async () => { await session.acceptInvite(theirs.key); onClose(); })}>Accept their invitation</button>
+          </div>
+        )}
         <ErrorFlash error={error} />
         <div className="row" style={{ justifyContent: 'space-between' }}>
           <button type="button" className="btn link" onClick={onGroup}>New group instead</button>

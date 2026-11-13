@@ -68,6 +68,18 @@ export class Db {
     const all = await this.run<IDBValidKey[]>(store, 'readonly', (s) => s.getAllKeys());
     return (all as string[]).filter((k) => typeof k === 'string' && k.startsWith(prefix));
   }
+  /** Delete every stored message of one chat room. */
+  async deleteMessages(groupId: string): Promise<void> {
+    await this.run('messages', 'readwrite', (s) => {
+      const req = s.index('byGroup').openKeyCursor(IDBKeyRange.bound([groupId, -Infinity], [groupId, Infinity]));
+      req.onsuccess = () => {
+        const c = req.result;
+        if (!c) return;
+        s.delete(c.primaryKey);
+        c.continue();
+      };
+    });
+  }
   messages<T>(groupId: string): Promise<T[]> {
     return this.run('messages', 'readonly', (s) =>
       s.index('byGroup').getAll(IDBKeyRange.bound([groupId, -Infinity], [groupId, Infinity])),

@@ -283,6 +283,16 @@ export class Chat {
     return chat;
   }
 
+  /** Remove what's left of an ended room on this device (its bookkeeping), so nothing of it remains. */
+  async purge(groupId: string) {
+    const g = this.groups.get(groupId);
+    if (g) await g.end();
+    const dev = this.opts.device;
+    await dev.keystore.delete(`chat/group/${groupId}`);
+    await dev.ephemeral.delete(`chat/state/${groupId}`);
+    await dev.ephemeral.delete(`chat/pending/${groupId}`);
+  }
+
   get identity() {
     return this.opts.identity;
   }
@@ -954,6 +964,14 @@ export class Group {
   rotationDue(): boolean {
     const r = this.chat.opts.rotation;
     return this.meta.sentSinceUpdate >= r.maxMessages || this.chat.now() - this.meta.lastUpdateAt >= r.maxAgeMs;
+  }
+
+  /**
+   * End this room on this device (after Close, Quit, or a close from the owner): delete the
+   * epoch and ratchet secrets right away. Messages already decrypted are the app's business.
+   */
+  async end() {
+    if (!this.meta.removed) await this.forget();
   }
 
   private async forget() {

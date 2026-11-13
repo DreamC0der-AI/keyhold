@@ -134,7 +134,12 @@ export function githubProvider(o: GitHubProviderOptions): StorageProvider & { cl
     const r = await gh.call('PUT', contents(owner, repo, path), body);
     if (r.status === 200 || r.status === 201) return 'ok';
     if (r.status === 409 || r.status === 422) return 'conflict';
-    if (r.status === 404 && sha === null) return 'conflict';
+    if (r.status === 404 && sha === null) {
+      // A create can 404 on a race over a new folder, but also because the repo is gone (deleted,
+      // or our access ended). Only the first is worth a retry.
+      if ((await gh.call('GET', `/repos/${enc(owner)}/${enc(repo)}`)).status === 404) throw new KeyholdError('forbidden', `no access to ${owner}/${repo}`);
+      return 'conflict';
+    }
     throw new KeyholdError(r.status === 403 || r.status === 404 ? 'forbidden' : 'config', `write ${path}: ${r.status}`);
   }
 

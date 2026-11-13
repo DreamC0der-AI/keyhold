@@ -188,3 +188,4 @@ label.field > span.hint { font-weight: 400; color: var(--muted); font-size: 12px
   .msg .col { max-width: 85%; }
   .hide-sm { display: none; }
 }
+.sys.divider { border-style: dashed; font-weight: 600; margin: 8px 0; }

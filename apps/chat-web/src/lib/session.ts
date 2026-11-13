@@ -29,6 +29,7 @@ import {
   type LookupResult,
 } from '@keyhold/chat/index';
 import type { AttachmentRef } from '@keyhold/chat/messages';
+import { sha256, toHex } from '@keyhold/util/bytes';
 import { generateRecoveryCode, parseRecoveryCode } from '@keyhold/keys/recovery';
 import { hkdfAesKey } from '@keyhold/util/hkdf';
 import { CONFIG, installUrl } from '../config';
@@ -64,6 +65,34 @@ export interface ChatRecord {
   hidden?: boolean;
   lastName?: string;
   deviceCount?: number;
+  /** The room's repo, kept so the room can still be shown after its group state is gone. */
+  space?: string;
+  kind?: 'dm' | 'group';
+  /** DM only: the other person. A conversation is the pair of people, across rooms. */
+  peer?: string;
+  /** The room ended for good (closed, quit, removed). Its history stays until Delete chat. */
+  ended?: { how: 'closed' | 'moved' | 'quit' | 'removed'; by?: string; at: number };
+  /** Delete chat: messages up to here were deleted and are never shown again. */
+  clearedAt?: number;
+  /** DM owner side: the other person quit. */
+  peerLeft?: boolean;
+}
+
+/** What the chat list shows: a DM is one entry per person, whatever rooms it went through. */
+export interface Convo {
+  key: string;
+  dm: boolean;
+  peer?: string;
+  /** Rooms oldest first. */
+  rooms: ChatRecord[];
+  /** The room messages go to now. */
+  live?: Group;
+  /** The newest room that still has group state (live, or unavailable). */
+  current?: Group;
+  title: string;
+  lastTs: number;
+  lastText?: string;
+  unread: number;
 }
 
 export interface PendingInvite {
@@ -76,6 +105,10 @@ export interface PendingInvite {
    * waiting: asked the inviter's app to confirm our identity. error: the last try failed.
    */
   status: 'invited' | 'joining' | 'waiting' | 'error';
+  /** When the inviter sent it (from the inbox), to tell it apart from a later close. */
+  created?: number;
+  /** Accepting answered 404/410: the repo or invitation is gone. */
+  gone?: boolean;
   /** The GitHub invitation id, while it isn't accepted yet. The inbox doesn't name the repo. */
   pointer?: string;
   /** The invite inbox entry that told us about it. */
@@ -138,7 +171,8 @@ export class Session {
   records = new Map<string, ChatRecord>();
   groupErrors = new Map<string, string>();
   rateRemaining?: number;
-  activeGroup?: string;
+  /** The conversation on screen. */
+  activeConvo?: string;
   lastPollError?: string;
   /** Message ids being sent, per group, for the "sending…" bubble. */
   sending = new Map<string, { id: string; body: string; ts: number }[]>();
@@ -156,6 +190,12 @@ export class Session {
   /** When each chat last had a full sync, as a fallback for GitHub's slow change check. */
   private lastFullSync = new Map<string, number>();
   private kick?: () => void;
+  /** People this account blocked: their invitations are declined by themselves. */
+  blocked = new Set<string>();
+  /** Rooms to end once the current sync is done (a close arrived while syncing). */
+  private toEnd = new Map<string, NonNullable<ChatRecord['ended']>>();
+  private userIds = new Map<string, Promise<number | undefined>>();
+  private lastClosures = 0;
   private peers = new Map<string, Promise<PeerInfo>>();
 
   constructor(readonly auth: AuthState) {
@@ -414,8 +454,9 @@ export class Session {
       const r = await this.db.get<ChatRecord>('kv', k);
       if (r) this.records.set(r.groupId, r);
     }
-    for (const g of this.chat.groups.values()) this.record(g.id);
+    for (const g of this.chat.groups.values()) this.fill(g);
     for (const k of await this.db.keys('kv', 'declined:')) this.declined.add(k.slice('declined:'.length));
+    for (const k of await this.db.keys('kv', 'block:')) this.blocked.add(k.slice('block:'.length));
     this.phase = 'ready';
     void this.loop();
   }
@@ -433,15 +474,131 @@ export class Session {
     return this.db.put('kv', r, `chat:${r.groupId}`);
   }
 
-  groups(): Group[] {
+  /** Keep what a room needs for display after its group state is gone. */
+  fill(g: Group): ChatRecord {
+    const r = this.record(g.id);
+    let changed = false;
+    if (!r.space) { r.space = g.space; changed = true; }
+    const kind = this.isDm(g) ? 'dm' : 'group';
+    if (r.kind !== kind) { r.kind = kind; changed = true; }
+    if (kind === 'dm') {
+      const p = this.dmPeer(g);
+      if (p && r.peer !== p) { r.peer = p; changed = true; }
+    } else if (g.name && r.lastName !== g.name) { r.lastName = g.name; changed = true; }
+    if (changed) void this.saveRecord(r);
+    return r;
+  }
+
+  convoKey(r: ChatRecord) {
+    return r.kind === 'dm' && r.peer ? `dm:${r.peer}` : r.groupId;
+  }
+
+  /** Is this room part of the conversation on screen? */
+  private onScreen(groupId: string) {
+    const r = this.records.get(groupId);
+    return !!r && !!this.activeConvo && this.convoKey(r) === this.activeConvo;
+  }
+
+  conversations(): Convo[] {
     if (!this.chat) return [];
-    return [...this.chat.groups.values()]
-      .filter((g) => !this.records.get(g.id)?.hidden)
-      .sort((a, b) => (this.records.get(b.id)?.lastTs ?? 0) - (this.records.get(a.id)?.lastTs ?? 0));
+    for (const g of this.chat.groups.values()) this.fill(g);
+    const by = new Map<string, ChatRecord[]>();
+    for (const r of this.records.values()) {
+      if (r.hidden) continue;
+      const g = this.chat.groups.get(r.groupId);
+      if (!g && !r.ended) continue;
+      const k = this.convoKey(r);
+      by.set(k, [...(by.get(k) ?? []), r]);
+    }
+    const out: Convo[] = [];
+    for (const [key, rooms] of by) out.push(this.makeConvo(key, rooms));
+    return out.sort((a, b) => b.lastTs - a.lastTs);
+  }
+
+  convo(key: string): Convo | undefined {
+    const direct = this.conversations().find((c) => c.key === key);
+    if (direct) return direct;
+    // An old link to one room of a DM.
+    const r = this.records.get(key);
+    return r ? this.conversations().find((c) => c.key === this.convoKey(r)) : undefined;
+  }
+
+  private makeConvo(key: string, rooms: ChatRecord[]): Convo {
+    rooms.sort((a, b) => a.createdAt - b.createdAt);
+    const groups = rooms.map((r) => this.chat!.groups.get(r.groupId)).filter((g): g is Group => !!g);
+    const active = groups.filter((g) => g.active);
+    const dm = rooms[0]!.kind === 'dm';
+    // Two live rooms with the same person: the one owned by the lower GitHub user id wins (rule 2).
+    const live = active.length > 1 ? this.winner(active) : active[0];
+    const current = live ?? groups[groups.length - 1];
+    const last = rooms.reduce((a, b) => (b.lastTs >= a.lastTs ? b : a));
+    const peer = dm ? rooms.find((r) => r.peer)?.peer : undefined;
+    const name = [...rooms].reverse().find((r) => r.lastName)?.lastName;
+    return {
+      key, dm, peer, rooms, live, current,
+      title: dm ? (peer ? loginFrom(peer) : 'Direct message') : current?.name || name || 'Untitled group',
+      lastTs: last.lastTs,
+      lastText: last.lastText,
+      unread: rooms.reduce((n, r) => n + r.unread, 0),
+    };
+  }
+
+  /**
+   * Rule 2 tie-break, deterministic on both sides. A room both people are in beats one still
+   * waiting for the other to join; then the lowest owner user id; then the oldest room.
+   */
+  private winner(rooms: Group[]): Group {
+    const both = rooms.filter((g) => g.members().length > 1);
+    if (both.length) rooms = both;
+    const id = (g: Group) => this.knownUserId(g.space.split('/')[0]!);
+    return [...rooms].sort((a, b) => {
+      const ia = id(a), ib = id(b);
+      if (ia !== undefined && ib !== undefined && ia !== ib) return ia - ib;
+      return (this.records.get(a.id)?.createdAt ?? 0) - (this.records.get(b.id)?.createdAt ?? 0);
+    })[0]!;
+  }
+
+  private knownIds = new Map<string, number>();
+  private knownUserId(login: string) {
+    const l = login.toLowerCase();
+    if (!this.knownIds.has(l)) void this.userId(l);
+    return this.knownIds.get(l);
+  }
+
+  /** A GitHub user's numeric id (stable across renames), cached in this browser. */
+  userId(login: string): Promise<number | undefined> {
+    const l = login.toLowerCase();
+    let p = this.userIds.get(l);
+    if (!p) {
+      p = (async () => {
+        const cached = await this.db.get<number>('kv', `uid:${l}`);
+        if (cached) return cached;
+        const r = await this.ghJson<{ id: number }>(`/users/${encodeURIComponent(l)}`);
+        if (r.status !== 200 || typeof r.data?.id !== 'number') return undefined;
+        await this.db.put('kv', r.data.id, `uid:${l}`);
+        return r.data.id;
+      })().then((v) => {
+        if (v !== undefined) {
+          this.knownIds.set(l, v);
+          this.bump();
+        } else this.userIds.delete(l);
+        return v;
+      }, () => {
+        this.userIds.delete(l);
+        return undefined;
+      });
+      this.userIds.set(l, p);
+    }
+    return p;
   }
 
   group(id: string) {
     return this.chat?.groups.get(id);
+  }
+
+  /** Did this account start the room (own its repo)? Only the owner can close it. */
+  isOwner(room: { space?: string }) {
+    return room.space?.split('/')[0]?.toLowerCase() === this.login;
   }
 
   isDm(g: Group) {
@@ -491,27 +648,57 @@ export class Session {
     return l;
   }
 
-  async startDm(input: string): Promise<Group> {
+  /** An invitation from this person that is waiting for Accept. */
+  inviteFrom(input: string): PendingInvite | undefined {
+    let a: string;
+    try {
+      a = toAddress(input.trim().replace(/^@/, '').toLowerCase());
+    } catch {
+      return undefined;
+    }
+    return this.pendingInvites().find((i) => i.from === a && i.status === 'invited');
+  }
+
+  /** The live DM with this person, if any (rule 1: one live room per conversation). */
+  liveDm(address: string): Convo | undefined {
+    return this.conversations().find((c) => c.dm && c.peer === address && c.live);
+  }
+
+  /** Open the chat with this person, or start one. Returns the conversation key. */
+  async startDm(input: string): Promise<string> {
     const login = this.normLogin(input);
-    const existing = this.groups().find((g) => this.isDm(g) && this.dmPeer(g) === toAddress(login));
-    if (existing) return existing;
+    const address = toAddress(login);
+    if (this.blocked.has(address)) throw new Error(`You blocked ${login}. Unblock them in Account and devices first.`);
+    let existing = this.liveDm(address);
+    if (existing) return existing.key;
+    // Another of my devices may have started it already: join my own rooms first.
+    await this.checkInvites(true);
+    existing = this.liveDm(address);
+    if (existing) return existing.key;
     if (!(await this.userExists(login))) throw new Error(`No GitHub user named ${login}`);
+    // Rooms that are only unavailable get replaced now: their secrets can go.
+    for (const c of this.conversations()) {
+      if (c.dm && c.peer === address) for (const r of c.rooms) await this.chat!.groups.get(r.groupId)?.end();
+    }
     const g = await this.chat!.createGroup('dm');
     const r = this.record(g.id);
-    r.invited = [toAddress(login)];
+    r.invited = [address];
+    r.kind = 'dm';
+    r.peer = address;
+    r.space = g.space;
     await this.saveRecord(r);
     this.bump();
-    await g.invite(toAddress(login));
+    await g.invite(address);
     await this.systemNote(g.id, `Invitation sent to @${login}. The chat opens for them when they accept in this app.`);
     this.bump();
-    return g;
+    return this.convoKey(r);
   }
 
   async createGroup(name: string, inputs: string[]): Promise<{ group: Group; failed: string[] }> {
     const logins = [...new Set(inputs.filter((s) => s.trim()).map((s) => this.normLogin(s)))];
     for (const l of logins) if (!(await this.userExists(l))) throw new Error(`No GitHub user named ${l}`);
     const g = await this.chat!.createGroup('group', name.trim() || undefined);
-    this.record(g.id);
+    this.fill(g);
     this.bump();
     const failed: string[] = [];
     for (const l of logins) {
@@ -544,19 +731,100 @@ export class Session {
     await this.syncGroup(g);
   }
 
-  async leave(g: Group) {
-    await g.leave();
-    const r = this.record(g.id);
-    r.hidden = true;
-    await this.saveRecord(r);
-    if (this.activeGroup === g.id) this.activeGroup = undefined;
+  /** Tag for closure notices: the members' apps can match it, the Worker can't link it to a repo. */
+  private async closureTag(groupId: string) {
+    return toHex(await sha256(new TextEncoder().encode(`keyhold-chat-web/v1/closure:${groupId}`))).slice(0, 32);
+  }
+
+  /**
+   * Close chat (repo owner): tell the members, delete the repo, then drop this room's secrets.
+   * History stays on every device until someone uses Delete chat.
+   */
+  async closeChat(g: Group, reason: 'closed' | 'moved' = 'closed') {
+    if (!this.isOwner(g)) throw new Error('Only the person who started this chat can close it.');
+    const r = this.fill(g);
+    const others = new Set([...g.members().map((m) => m.address), ...r.invited].filter((a) => a !== this.address));
+    if (g.active && g.members().some((m) => m.address !== this.address)) await g.send({ t: 'sys.close', reason }).catch(() => undefined);
+    const tag = await this.closureTag(g.id);
+    for (const a of others) {
+      await this.ghFetch(`${CONFIG.worker}/closures`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ to: loginFrom(a), tag }),
+      }).catch(() => undefined);
+    }
+    const del = await this.ghFetch(`${CONFIG.api}/repos/${g.space}`, { method: 'DELETE', headers: { Accept: 'application/vnd.github+json' } });
+    if (del.status !== 204 && del.status !== 404) throw new Error(`GitHub didn't delete the chat's repo (${del.status}). The chat is still open.`);
+    await this.endRoom(g.id, { how: reason, by: this.address, at: Date.now() });
+  }
+
+  /** Quit chat (not the owner): leave the group, then the repo. History stays here. */
+  async quitChat(g: Group) {
+    if (this.isOwner(g)) throw new Error('You started this chat, so you can close it but not quit it.');
+    this.fill(g);
+    if (g.active) await g.leave();
+    // The owner's app removes our access anyway once it sees we left; this is just quicker.
+    await this.ghFetch(`${CONFIG.api}/repos/${g.space}/collaborators/${encodeURIComponent(this.login)}`, { method: 'DELETE' }).catch(() => undefined);
+    await this.endRoom(g.id, { how: 'quit', by: this.address, at: Date.now() });
+  }
+
+  /** Mark a room ended and delete its secrets (they must not outlive the room). */
+  private async endRoom(groupId: string, ended: NonNullable<ChatRecord['ended']>) {
+    const r = this.record(groupId);
+    if (!r.ended) {
+      r.ended = ended;
+      await this.saveRecord(r);
+    }
+    await this.chat!.groups.get(groupId)?.end();
     this.bump();
   }
 
-  async hide(g: Group) {
-    const r = this.record(g.id);
-    r.hidden = true;
-    await this.saveRecord(r);
+  /**
+   * Delete chat: erase my copy of the history, every room of the conversation. A live room stays
+   * live (new messages still arrive); ended rooms go away completely, with their leftovers.
+   */
+  async deleteHistory(key: string) {
+    const c = this.convo(key);
+    if (!c) return;
+    const now = Date.now();
+    for (const r of c.rooms) {
+      await this.db.deleteMessages(r.groupId);
+      const g = this.chat!.groups.get(r.groupId);
+      if (g && g.active) {
+        r.clearedAt = now;
+        r.lastText = undefined;
+        r.unread = 0;
+        await this.saveRecord(r);
+      } else {
+        await this.chat!.purge(r.groupId);
+        // If GitHub still lists the repo for a while (the owner's app hasn't removed us yet), it
+        // must not come back as an invitation.
+        if (r.space) {
+          this.declined.add(r.space);
+          await this.db.put('kv', now, `declined:${r.space}`);
+        }
+        this.records.delete(r.groupId);
+        await this.db.del('kv', `chat:${r.groupId}`);
+      }
+    }
+    this.bump();
+  }
+
+  async block(address: string) {
+    this.blocked.add(address);
+    await this.db.put('kv', Date.now(), `block:${address}`);
+    const c = this.liveDm(address);
+    if (c?.live) {
+      if (this.isOwner(c.live)) await this.closeChat(c.live);
+      else await this.quitChat(c.live);
+    }
+    for (const inv of this.pendingInvites()) if (inv.from === address && inv.status === 'invited') await this.declineInvite(inv.key).catch(() => undefined);
+    this.bump();
+  }
+
+  async unblock(address: string) {
+    this.blocked.delete(address);
+    await this.db.del('kv', `block:${address}`);
     this.bump();
   }
 
@@ -579,6 +847,11 @@ export class Session {
     this.bump();
     try {
       await g.send({ t: 'text', body });
+    } catch (e) {
+      // The repo may be gone (closed): a sync turns that into the chat's state.
+      await this.syncGroup(g);
+      if (!g.active) throw new Error('This chat has ended, so the message was not sent.');
+      throw e;
     } finally {
       this.sending.set(g.id, (this.sending.get(g.id) ?? []).filter((p) => p.id !== pendingId));
       this.bump();
@@ -619,11 +892,19 @@ export class Session {
     const msg = m.message;
     const mine = m.from.fingerprint === this.identity?.fingerprint;
     const base = { groupId: g.id, id: msg.id, ts: msg.ts, from: m.from.address, fromFp: m.from.fingerprint, mine };
-    const r = this.record(g.id);
+    const r = this.fill(g);
+    if (msg.t === 'sys.close') {
+      // Only the repo owner can end the room.
+      const owner = toAddress(g.space.split('/')[0]!.toLowerCase());
+      if (!mine && m.from.address === owner) this.toEnd.set(g.id, { how: msg.reason === 'moved' ? 'moved' : 'closed', by: owner, at: msg.ts });
+      return;
+    }
+    // Delete chat: never show what was deleted again, even though old keys may still open it.
+    if (r.clearedAt && msg.ts <= r.clearedAt) return;
     const touch = async (preview: string) => {
       r.lastTs = Math.max(r.lastTs, msg.ts);
       r.lastText = preview;
-      if (!mine && this.activeGroup !== g.id) r.unread++;
+      if (!mine && !this.onScreen(g.id)) r.unread++;
       await this.saveRecord(r);
     };
     switch (msg.t) {
@@ -686,9 +967,20 @@ export class Session {
       if (e.type === 'joined') {
         await this.systemNote(g.id, e.address === this.address ? 'You joined. Messages are end-to-end encrypted.' : `${who} joined`);
         this.peers.delete(e.address);
-      } else if (e.type === 'left') await this.systemNote(g.id, `${who} left`);
-      else if (e.type === 'removed') await this.systemNote(g.id, 'You were removed from this chat.');
-      else if (e.type === 'access-lost') await this.systemNote(g.id, 'GitHub no longer gives you access to this chat.');
+      } else if (e.type === 'left') {
+        await this.systemNote(g.id, `${who} left`);
+        if (this.isDm(g) && e.address !== this.address && !g.members().some((m) => m.address !== this.address)) {
+          r.peerLeft = true;
+          await this.saveRecord(r);
+        }
+      } else if (e.type === 'removed') this.toEnd.set(g.id, { how: 'removed', at: Date.now() });
+      else if (e.type === 'access-lost') {
+        // Our own repo gone means we closed it (on another device, or on github.com). Someone
+        // else's is only unavailable: it may come back, so nothing is deleted.
+        if (this.isOwner(g) && (await this.ghFetch(`${CONFIG.api}/repos/${g.space}`)).status === 404) {
+          this.toEnd.set(g.id, { how: 'closed', by: this.address, at: Date.now() });
+        }
+      }
       else if (e.type === 'undecryptable') await this.systemNote(g.id, 'A message could not be decrypted.');
       else if (e.type === 'rejected') await this.systemNote(g.id, `A change to the group was rejected (${e.reason}).`);
     }
@@ -704,6 +996,11 @@ export class Session {
       this.groupErrors.delete(g.id);
     } catch (e) {
       this.groupErrors.set(g.id, describeError(e));
+    }
+    const end = this.toEnd.get(g.id);
+    if (end) {
+      this.toEnd.delete(g.id);
+      await this.endRoom(g.id, end);
     }
     this.bump();
   }
@@ -730,7 +1027,19 @@ export class Session {
     for (const n of notices) {
       const key = `notice:${n.id}`;
       if (this.invites.has(key)) continue;
-      this.invites.set(key, { key, from: n.from, status: 'invited', pointer: n.pointer, noticeId: n.id, since: now, attempts: 0, nextTry: 0 });
+      const created = n.expiresAt ? n.expiresAt - 7 * 24 * 3600_000 : now;
+      this.invites.set(key, { key, from: n.from, status: 'invited', pointer: n.pointer, noticeId: n.id, since: now, created, attempts: 0, nextTry: 0 });
+    }
+    for (const inv of [...this.invites.values()]) {
+      if (inv.status !== 'invited') continue;
+      // Blocked people's invitations are turned down without asking.
+      if (this.blocked.has(inv.from)) {
+        await this.declineInvite(inv.key).catch(() => undefined);
+        continue;
+      }
+      // Both of us started a DM at once (case 25): I asked to chat with them, so take theirs too.
+      // Rule 2 then keeps one of the two rooms.
+      if (!inv.space && this.ownPendingDm(inv.from)) await this.acceptInvite(inv.key).catch(() => undefined);
     }
     // Listing every repo the app can see costs a few requests: do it when asked, while something
     // is pending, or once a minute.
@@ -740,8 +1049,10 @@ export class Session {
       have = known();
       for (const space of await p.channel.listSpaces()) {
         if (have.has(space) || this.invites.has(space) || this.declined.has(space)) continue;
+        if ([...this.records.values()].some((r) => r.space === space && r.ended)) continue;
         const owner = space.split('/')[0]!.toLowerCase();
         const from = toAddress(owner);
+        if (this.blocked.has(from)) continue;
         // Accepted here: an accepted notice from the same person is this repo. Our own repo means
         // another of our devices made the chat. Anything else was accepted outside this app
         // (on github.com), so it still waits for Accept here.
@@ -772,7 +1083,7 @@ export class Session {
         const g = await chat.join(inv.space);
         if (g) {
           this.invites.delete(inv.key);
-          this.record(g.id);
+          this.fill(g);
           await this.syncGroup(g);
           continue;
         }
@@ -790,16 +1101,32 @@ export class Session {
     this.bump();
   }
 
+  /** I invited them to a DM and they haven't joined yet. */
+  private ownPendingDm(address: string) {
+    return this.conversations().some((c) => c.dm && c.peer === address && c.live && this.isOwner(c.live) && !c.live.members().some((m) => m.address === address));
+  }
+
   /** The user accepted: accept the GitHub invitation, then join the chat. */
   async acceptInvite(key: string) {
     const inv = this.invites.get(key);
     if (!inv || inv.status !== 'invited') return;
     const p = this.provider;
-    if (inv.pointer) await p.channel.acceptGrant(inv.pointer);
+    let gone = false;
+    if (inv.pointer) {
+      const id = inv.pointer.split('#').pop()!;
+      const r = await this.ghFetch(`${CONFIG.api}/user/repository_invitations/${encodeURIComponent(id)}`, { method: 'PATCH', headers: { Accept: 'application/vnd.github+json' } });
+      // 404/410: withdrawn (the chat was closed), expired, or already accepted on another device.
+      if (r.status === 404 || r.status === 410) gone = true;
+      else if (r.status !== 204) throw new Error(`GitHub didn't accept the invitation (${r.status}).`);
+    }
     if (inv.noticeId) await p.inviteInbox.delete(inv.noticeId).catch(() => {});
-    Object.assign(inv, { status: 'joining', pointer: undefined, noticeId: undefined, nextTry: 0, attempts: 0, since: Date.now() });
+    Object.assign(inv, { status: 'joining', pointer: undefined, noticeId: undefined, nextTry: 0, attempts: 0, since: Date.now(), gone });
     this.bump();
     await this.checkInvites(true);
+    // Already accepted elsewhere shows up as a repo in that scan; if nothing did, it's gone.
+    const still = this.invites.get(key);
+    if (still && gone) Object.assign(still, { status: 'error', error: `@${loginFrom(inv.from)} withdrew this invitation or closed the chat.` });
+    this.bump();
   }
 
   /** The user declined: turn down the GitHub invitation (or leave the repo) and forget the chat. */
@@ -846,15 +1173,17 @@ export class Session {
 
   // ---- polling ----
 
-  setActive(groupId: string | undefined) {
-    this.activeGroup = groupId;
-    if (groupId) {
-      const r = this.records.get(groupId);
-      if (r && r.unread) {
-        r.unread = 0;
-        void this.saveRecord(r);
+  setActive(key: string | undefined) {
+    this.activeConvo = key;
+    const c = key ? this.convo(key) : undefined;
+    if (c) {
+      for (const r of c.rooms) {
+        if (r.unread) {
+          r.unread = 0;
+          void this.saveRecord(r);
+        }
+        this.lastCheck.delete(r.groupId);
       }
-      this.lastCheck.delete(groupId);
       this.kick?.();
     }
     this.bump();
@@ -901,17 +1230,22 @@ export class Session {
       this.lastInvites = now;
       await this.checkInvites();
     }
+    if (now - this.lastClosures > (hidden ? HIDDEN_POLL_MS : INVITE_POLL_MS)) {
+      this.lastClosures = now;
+      await this.checkClosures().catch(() => undefined);
+    }
+    await this.resolveDuplicates().catch(() => undefined);
     for (const g of this.chat.groups.values()) {
       if (!g.active) continue;
       const rec = this.records.get(g.id);
       // Recently busy chats, and chats waiting for someone to join, are checked more often.
       const warm = rec && (now - rec.lastTs < 2 * 60_000 || this.pending(g).length > 0);
-      const every = hidden ? HIDDEN_POLL_MS : g.id === this.activeGroup ? ACTIVE_POLL_MS : warm ? WARM_POLL_MS : IDLE_POLL_MS;
+      const every = hidden ? HIDDEN_POLL_MS : this.onScreen(g.id) ? ACTIVE_POLL_MS : warm ? WARM_POLL_MS : IDLE_POLL_MS;
       if (now - (this.lastCheck.get(g.id) ?? 0) < every) continue;
       this.lastCheck.set(g.id, Date.now());
       // GitHub's change check can lag up to a minute behind a push, so the open chat and busy
       // chats also get a full sync every little while whatever it says.
-      const fallback = hidden ? Infinity : g.id === this.activeGroup ? FULL_SYNC_ACTIVE_MS : warm ? FULL_SYNC_WARM_MS : Infinity;
+      const fallback = hidden ? Infinity : this.onScreen(g.id) ? FULL_SYNC_ACTIVE_MS : warm ? FULL_SYNC_WARM_MS : Infinity;
       try {
         const changed = await this.headChanged(g.space);
         if (changed || now - (this.lastFullSync.get(g.id) ?? 0) >= fallback) {
@@ -921,6 +1255,47 @@ export class Session {
       } catch (e) {
         this.groupErrors.set(g.id, describeError(e));
       }
+    }
+  }
+
+  /** Closure notices from the Worker: how an offline member learns a chat was closed. */
+  private async checkClosures() {
+    const r = await this.ghFetch(`${CONFIG.worker}/closures`);
+    if (r.status !== 200) return;
+    const { closures } = (await r.json()) as { closures: { id: string; from: string; tag: string; at: string }[] };
+    if (!closures.length) return;
+    const tags = new Map<string, ChatRecord>();
+    for (const rec of this.records.values()) if (!rec.ended) tags.set(await this.closureTag(rec.groupId), rec);
+    for (const n of closures) {
+      const from = toAddress(n.from.toLowerCase());
+      const at = Date.parse(n.at) || Date.now();
+      const rec = tags.get(n.tag);
+      // Believe it only from the room's owner.
+      if (rec && rec.space?.split('/')[0]?.toLowerCase() === n.from.toLowerCase()) await this.endRoom(rec.groupId, { how: 'closed', by: from, at });
+      // An invitation from them sent before the close was for the closed room.
+      for (const [k, inv] of this.invites) {
+        if (inv.from === from && inv.status === 'invited' && !inv.space && (inv.created ?? 0) <= at) {
+          this.invites.delete(k);
+          if (inv.noticeId) await this.provider.inviteInbox.delete(inv.noticeId).catch(() => undefined);
+        }
+      }
+    }
+    this.bump();
+  }
+
+  /**
+   * Rule 2: two live DM rooms with the same person (both pressed "new chat" at once). Both apps
+   * pick the room owned by the lower GitHub user id; the owner of the other one closes it.
+   */
+  private async resolveDuplicates() {
+    for (const c of this.conversations()) {
+      if (!c.dm || !c.live) continue;
+      const active = c.rooms.map((r) => this.chat!.groups.get(r.groupId)).filter((g): g is Group => !!g && g.active);
+      if (active.length < 2) continue;
+      const owners = await Promise.all(active.map((g) => this.userId(g.space.split('/')[0]!)));
+      if (owners.some((o) => o === undefined)) continue;
+      const win = this.winner(active);
+      for (const g of active) if (g !== win && this.isOwner(g)) await this.closeChat(g, 'moved');
     }
   }
 
