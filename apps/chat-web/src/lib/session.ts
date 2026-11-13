@@ -66,6 +66,20 @@ export interface ChatRecord {
   deviceCount?: number;
 }
 
+export interface PendingInvite {
+  key: string;
+  /** The chat's repo, once it shows up among the repos we can open. */
+  space?: string;
+  from: string;
+  /** opening: invitation accepted, repo not visible yet. joining: trying now. waiting: asked the inviter's app to confirm our identity. */
+  status: 'opening' | 'joining' | 'waiting' | 'error';
+  error?: string;
+  since: number;
+  attempts: number;
+  nextTry: number;
+  dismissed?: boolean;
+}
+
 export interface PeerInfo {
   address: string;
   status: LookupResult['status'] | 'error';
@@ -81,7 +95,6 @@ const IDLE_POLL_MS = 20_000;
 const WARM_POLL_MS = 6_000;
 const HIDDEN_POLL_MS = 90_000;
 const INVITE_POLL_MS = 15_000;
-const JOIN_RETRY_MS = 3 * 60_000;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 export const loginFrom = (address: string) => {
@@ -128,7 +141,7 @@ export class Session {
   private etags = new Map<string, string>();
   private lastInvites = 0;
   private lastSpaceScan = 0;
-  private joinTried = new Map<string, number>();
+  private invites = new Map<string, PendingInvite>();
   private kick?: () => void;
   private peers = new Map<string, Promise<PeerInfo>>();
 
@@ -685,6 +698,7 @@ export class Session {
   async checkInvites(force = false) {
     const p = this.provider;
     const chat = this.chat!;
+    const now = Date.now();
     let notices: Awaited<ReturnType<typeof p.inviteInbox.list>> = [];
     try {
       notices = await p.inviteInbox.list();
@@ -695,32 +709,74 @@ export class Session {
       try {
         await p.channel.acceptGrant(n.pointer);
         await p.inviteInbox.delete(n.id);
+        // The inbox only says who invited us, not which repo; show it until the repo turns up.
+        const key = `notice:${n.id}`;
+        if (!this.invites.has(key)) this.invites.set(key, { key, from: n.from, status: 'opening', since: now, attempts: 0, nextTry: 0 });
       } catch (e) {
         this.lastPollError = describeError(e);
       }
     }
-    const now = Date.now();
     // Listing every repo the app can see costs a few requests: do it when an invite came in,
-    // when asked, or once a minute (covers invites accepted elsewhere and new own devices).
-    if (!force && !notices.length && now - this.lastSpaceScan < 60_000) return this.bump();
-    this.lastSpaceScan = now;
-    const known = new Set([...chat.groups.values()].map((g) => g.space));
-    for (const space of await p.channel.listSpaces()) {
-      if (known.has(space)) continue;
-      const tried = this.joinTried.get(space);
-      if (!force && !notices.length && tried && now - tried < JOIN_RETRY_MS) continue;
-      try {
-        const g = await chat.join(space);
-        if (g) {
-          this.record(g.id);
-          this.joinTried.delete(space);
-          await this.syncGroup(g);
-        } else this.joinTried.set(space, now);
-      } catch (e) {
-        this.joinTried.set(space, now);
-        this.lastPollError = describeError(e);
+    // when asked, while something is pending, or once a minute.
+    const scanEvery = this.invites.size ? 15_000 : 60_000;
+    if (force || notices.length || now - this.lastSpaceScan >= scanEvery) {
+      this.lastSpaceScan = now;
+      const known = new Set([...chat.groups.values()].map((g) => g.space));
+      for (const space of await p.channel.listSpaces()) {
+        if (known.has(space) || this.invites.has(space)) continue;
+        const from = toAddress(space.split('/')[0]!);
+        // A notice from the same person is this repo: replace it.
+        for (const [k, v] of this.invites) if (k.startsWith('notice:') && v.from === from) this.invites.delete(k);
+        this.invites.set(space, { key: space, space, from, status: 'joining', since: now, attempts: 0, nextTry: 0 });
       }
+      // Notices whose repo never showed up go away after a few minutes.
+      for (const [k, v] of this.invites) if (k.startsWith('notice:') && now - v.since > 5 * 60_000) this.invites.delete(k);
     }
+    for (const inv of [...this.invites.values()]) {
+      if (!inv.space || inv.dismissed) continue;
+      if ([...chat.groups.values()].some((g) => g.space === inv.space)) {
+        this.invites.delete(inv.key);
+        continue;
+      }
+      if (!force && now < inv.nextTry) continue;
+      inv.status = 'joining';
+      this.bump();
+      try {
+        const g = await chat.join(inv.space);
+        if (g) {
+          this.invites.delete(inv.key);
+          this.record(g.id);
+          await this.syncGroup(g);
+          continue;
+        }
+        // No ticket for our identity yet: we asked the inviter's app for one. It answers the
+        // next time it syncs, so try again soon, then back off.
+        inv.status = 'waiting';
+        inv.error = undefined;
+      } catch (e) {
+        inv.status = 'error';
+        inv.error = describeError(e);
+      }
+      inv.attempts++;
+      inv.nextTry = Date.now() + Math.min(10_000 * 2 ** Math.min(inv.attempts - 1, 5), 3 * 60_000);
+    }
+    this.bump();
+  }
+
+  /** Invitations that haven't turned into a chat yet, for the sidebar. */
+  pendingInvites(): PendingInvite[] {
+    return [...this.invites.values()].filter((i) => !i.dismissed).sort((a, b) => b.since - a.since);
+  }
+
+  async retryInvite(key: string) {
+    const inv = this.invites.get(key);
+    if (inv) inv.nextTry = 0;
+    await this.checkInvites(true);
+  }
+
+  dismissInvite(key: string) {
+    const inv = this.invites.get(key);
+    if (inv) inv.dismissed = true;
     this.bump();
   }
 
@@ -777,7 +833,7 @@ export class Session {
     if (!this.chat) return;
     const now = Date.now();
     const hidden = document.visibilityState === 'hidden';
-    if (now - this.lastInvites > (hidden ? HIDDEN_POLL_MS : INVITE_POLL_MS)) {
+    if (now - this.lastInvites > (hidden ? HIDDEN_POLL_MS : this.invites.size ? 5_000 : INVITE_POLL_MS)) {
       this.lastInvites = now;
       await this.checkInvites();
     }

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { Group } from '@keyhold/chat/index';
-import { loginFrom, type Session } from '../lib/session';
+import { loginFrom, type PendingInvite, type Session } from '../lib/session';
 import { Avatar, ErrorFlash, go, Icon, Modal, timeLabel, useAction, useSession } from '../ui';
 import { Conversation } from './Conversation';
 
@@ -51,12 +51,13 @@ export function Home({ session, route }: { session: Session; route: string }) {
             </div>
           </div>
           <ul className="chat-list">
+            <Invites session={session} />
             {shown.map((g) => <ChatRow key={g.id} session={session} g={g} active={g.id === group?.id} />)}
-            {!groups.length && (
+            {!groups.length && !session.pendingInvites().length && (
               <li className="empty" style={{ padding: 32 }}>
                 <p>No chats yet.</p>
                 <button className="btn primary" onClick={() => setModal('dm')}>Start a chat</button>
-                <p className="small">Invitations from others show up here by themselves.</p>
+                <p className="small">When someone invites you, the invitation shows up right here and opens by itself.</p>
               </li>
             )}
           </ul>
@@ -107,6 +108,42 @@ function ChatRow({ session, g, active }: { session: Session; g: Group; active: b
           {!!r?.unread && <span className="counter">{r.unread}</span>}
         </span>
       </button>
+    </li>
+  );
+}
+
+function Invites({ session }: { session: Session }) {
+  const list = session.pendingInvites();
+  if (!list.length) return null;
+  const text = (s: PendingInvite['status'], from: string) =>
+    s === 'opening' ? 'Invitation accepted. Opening the chat…'
+    : s === 'joining' ? 'Joining…'
+    : s === 'waiting' ? `Waiting for @${from}'s app to confirm your identity. This happens as soon as they have Keyhold Chat open.`
+    : 'Could not join yet.';
+  return (
+    <li style={{ borderBottom: '1px solid var(--border)', background: 'var(--accent-bg)' }}>
+      <div className="small" style={{ padding: '8px 16px 0', fontWeight: 600 }}>Invitations</div>
+      {list.map((inv) => {
+        const from = loginFrom(inv.from);
+        return (
+          <div key={inv.key} className="row" style={{ padding: '8px 16px', alignItems: 'flex-start', flexWrap: 'nowrap' }}>
+            <Avatar name={from} login={from} />
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div><strong>{from}</strong> invited you</div>
+              <div className="small muted" title={inv.error}>
+                {inv.status === 'joining' || inv.status === 'opening' ? <span className="spinner" style={{ width: 10, height: 10, marginRight: 4 }} /> : null}
+                {text(inv.status, from)}{inv.error ? ` ${inv.error}` : ''}
+              </div>
+              {(inv.status === 'waiting' || inv.status === 'error') && (
+                <div className="row" style={{ marginTop: 4 }}>
+                  <button className="btn" onClick={() => session.retryInvite(inv.key)}>Try again</button>
+                  <button className="btn link small" onClick={() => session.dismissInvite(inv.key)}>Dismiss</button>
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      })}
     </li>
   );
 }

@@ -132,6 +132,24 @@ try {
   check((await alice2.page.locator('.box-row', { hasText: 'Added' }).count()) === 2, 'two devices listed');
   await alice2.page.screenshot({ path: `${SHOTS}/settings.png` });
 
+  // invited before having an identity: joins after the inviter's app confirms it
+  const dave = await person('dave');
+  await dave.page.getByRole('button', { name: 'Create identity' }).waitFor();
+  await alice.page.getByRole('button', { name: 'New chat' }).first().click();
+  await alice.page.getByLabel('GitHub username').fill('dave');
+  await alice.page.getByRole('button', { name: 'Start chat' }).click();
+  await alice.page.locator('.sys', { hasText: 'Invitation sent to @dave' }).waitFor({ timeout: 30000 });
+  const t0 = Date.now();
+  await setup(dave);
+  await dave.page.getByText('alice invited you').waitFor({ timeout: 30000 }).then(() => dave.page.screenshot({ path: `${SHOTS}/invite-pending.png` })).catch(() => log('note: invite row not seen'));
+  await dave.page.locator('.chat-item', { hasText: 'alice' }).waitFor({ timeout: 90000 });
+  check(true, `dave (no identity when invited) joined after ${Math.round((Date.now() - t0) / 1000)}s`);
+  await dave.page.locator('.chat-item', { hasText: 'alice' }).click();
+  await sendMsg(dave, 'dave here');
+  await alice.page.locator('.chat-item', { hasText: 'dave' }).click();
+  await bubble(alice, 'dave here').waitFor({ timeout: 30000 });
+  check(true, 'dave and alice can talk');
+
   // first run: no install yet -> guided steps -> continues by itself
   const newbie = await person('newbie');
   await newbie.page.getByText('Two quick steps on GitHub').waitFor();
