@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import type { DeviceCertificate } from '@keyhold/chat/identity';
 import { signOut } from '../lib/auth';
 import { loginFrom, type Session } from '../lib/session';
-import { Avatar, ErrorFlash, Icon, Modal, Tip, useAction, useSession } from '../ui';
+import { Avatar, ErrorFlash, Icon, Modal, useAction, useSession } from '../ui';
 
 export function Settings({ session }: { session: Session }) {
   useSession(session);
@@ -18,25 +18,25 @@ export function Settings({ session }: { session: Session }) {
 
   return (
     <div className="app">
-      <header className="topbar">
-        <a href="#/" className="btn icon ghost" aria-label="Back to chats" title="Back to chats">{Icon.back()}</a>
-        <h1 className="topbar-title">Account</h1>
+      <header className="header">
+        <a href="#/" className="logo" aria-label="Chats home">{Icon.logo()}</a>
+        <nav className="crumbs" aria-label="Breadcrumb"><a href="#/">Chats</a><span className="muted">/</span><strong>Account and devices</strong></nav>
+        <span className="spacer" />
       </header>
       <div className="page">
         <div className="wide">
-          <div className="profile">
-            <Avatar name={session.login} login={session.login} size="xl" />
+          <div className="row" style={{ gap: 12 }}>
+            <Avatar name={session.login} login={session.login} size="lg" />
             <div>
               <h2>{session.login}</h2>
-              <div className="small muted row" style={{ gap: 4 }}>Fingerprint <span className="mono">{fp.slice(0, 8)} {fp.slice(8, 16)} {fp.slice(16, 24)} {fp.slice(24, 32)}</span></div>
+              <div className="small muted">Identity fingerprint <span className="mono">{fp.slice(0, 8)} {fp.slice(8, 16)} {fp.slice(16, 24)} {fp.slice(24, 32)}</span></div>
             </div>
           </div>
           <ErrorFlash error={error} />
 
           <section className="box">
-            <div className="box-header row">
+            <div className="box-header row" style={{ justifyContent: 'space-between' }}>
               <h3>Devices</h3>
-              <Tip align="start">To use another browser, sign in there and enter your recovery code. It joins your chats on its own but can't read older messages. Revoking a lost device removes it from every chat the next time a member's app syncs.</Tip>
             </div>
             {!devices ? (
               <div className="box-body"><span className="spinner" /></div>
@@ -51,44 +51,49 @@ export function Settings({ session }: { session: Session }) {
                 </div>
               ))
             )}
+            <div className="box-row small muted">
+              To use another browser or computer, sign in there and enter your recovery code. It joins your chats on its own; it can't read older messages. Revoking a lost device removes it from every chat the next time a member's app syncs.
+            </div>
           </section>
 
           <SyncBox session={session} />
 
           {session.blocked.size > 0 && (
             <section className="box">
-              <div className="box-header row"><h3>Blocked</h3><Tip align="start">Invitations from blocked people are turned down without asking you.</Tip></div>
+              <div className="box-header"><h3>Blocked</h3></div>
               {[...session.blocked].map((a) => (
                 <div className="box-row row" key={a} style={{ justifyContent: 'space-between' }}>
                   <span className="row" style={{ gap: 8 }}><Avatar name={loginFrom(a)} login={loginFrom(a)} size="sm" /> {loginFrom(a)}</span>
                   <button className="btn" onClick={() => run(() => session.unblock(a))}>Unblock</button>
                 </div>
               ))}
+              <div className="box-row small muted">Invitations from blocked people are turned down without asking you.</div>
             </section>
           )}
 
           <section className="box">
-            <div className="box-header row"><h3>Where your data lives</h3><Tip align="start">Each chat is a private <code>ghchat-…</code> repo. Decrypted messages are kept only in this browser.</Tip></div>
-            <a className="box-row link-row" href={`https://github.com/${session.login}/keyhold-id`} target="_blank" rel="noreferrer"><span className="grow">Public keys</span><span className="mono muted">{session.login}/keyhold-id</span></a>
-            <a className="box-row link-row" href={`https://github.com/${session.login}/${session.homeRepo}`} target="_blank" rel="noreferrer"><span className="grow">Encrypted identity backup</span><span className="mono muted">{session.login}/{session.homeRepo}</span></a>
+            <div className="box-header"><h3>Where your data lives</h3></div>
+            <div className="box-row small">Public keys: <a className="mono" href={`https://github.com/${session.login}/keyhold-id`} target="_blank" rel="noreferrer">{session.login}/keyhold-id</a></div>
+            <div className="box-row small">Encrypted backup of your identity: <a className="mono" href={`https://github.com/${session.login}/${session.homeRepo}`} target="_blank" rel="noreferrer">{session.login}/{session.homeRepo}</a> (private)</div>
+            <div className="box-row small">Chats: private <code>ghchat-…</code> repos, one per chat. Decrypted messages are kept only in this browser.</div>
           </section>
 
           <section className="box">
             <div className="box-header"><h3>Session</h3></div>
             <div className="box-row row" style={{ justifyContent: 'space-between' }}>
-              <span className="row" style={{ gap: 4 }}>Sign out <Tip align="start">Your keys stay in this browser, so signing back in picks up where you left off.</Tip></span>
+              <span>Sign out of GitHub here. Your keys stay in this browser, so signing back in picks up where you left off.</span>
               <button className="btn" onClick={() => { session.stop(); signOut(); location.hash = ''; location.reload(); }}>Sign out</button>
             </div>
             <div className="box-row row" style={{ justifyContent: 'space-between' }}>
-              <span className="row" style={{ gap: 4 }}>Remove from this browser <Tip align="start">Deletes this browser's keys and messages. You'll need your recovery code to come back.</Tip></span>
-              <button className="btn danger" onClick={() => confirm('Delete this browser\'s keys and message history? You need your recovery code to use this account here again.') && run(async () => { await session.forgetBrowser(); signOut(); location.hash = ''; location.reload(); })}>Remove</button>
+              <span>Remove this browser's keys and messages. You'll need your recovery code to come back.</span>
+              <button className="btn danger" onClick={() => confirm('Delete this browser\'s keys and message history? You need your recovery code to use this account here again.') && run(async () => { await session.forgetBrowser(); signOut(); location.hash = ''; location.reload(); })}>Remove from this browser</button>
             </div>
             <div className="box-row row" style={{ justifyContent: 'space-between' }}>
-              <span className="row" style={{ gap: 4 }}>Reset identity <Tip align="start">Start over with a brand-new identity. Contacts see a key change and your current chats stop working.</Tip></span>
-              <button className="btn danger" onClick={() => setReset(true)}>Reset</button>
+              <span>Start over with a brand-new identity. Contacts see a key change and your current chats stop working.</span>
+              <button className="btn danger" onClick={() => setReset(true)}>Reset identity</button>
             </div>
           </section>
-          <p className="small muted center">Keyhold Chat · MLS (RFC 9420) · GitHub is the only backend</p>
+          <p className="small muted">Keyhold Chat · E2E encrypted with MLS (RFC 9420) · GitHub is the only backend.</p>
         </div>
       </div>
       {revoke && <RevokeModal session={session} cert={revoke} onClose={() => setRevoke(undefined)} onDone={() => { setRevoke(undefined); void load(); }} />}
@@ -132,17 +137,19 @@ function SyncBox({ session }: { session: Session }) {
   const { busy, error, run } = useAction();
   return (
     <section className="box">
-      <div className="box-header row">
+      <div className="box-header row" style={{ justifyContent: 'space-between' }}>
         <h3>Sync across browsers</h3>
-        <Tip align="start">Your chat list, deleted and closed chats, read marks, blocks and declined invitations are kept, encrypted, in <span className="mono">{session.login}/{session.homeRepo}</span>. Other browsers apply them within about a minute.</Tip>
-        <span className="spacer" />
         {session.syncOn ? <span className="label green">On</span> : <span className="label">Off</span>}
       </div>
       {session.syncOn ? (
-        session.syncError ? <div className="box-row"><div className="flash warn">Sync problem: {session.syncError}</div></div> : null
+        <div className="box-row small">
+          Your chat list, deleted chats, closed chats, read marks, blocks and declined invitations are kept, encrypted, in{' '}
+          <span className="mono">{session.login}/{session.homeRepo}</span>. Your other browsers apply them within about a minute.
+          {session.syncError && <div className="flash warn" style={{ marginTop: 8 }}>Sync problem: {session.syncError}</div>}
+        </div>
       ) : (
         <div className="box-row stack">
-          <span className="small muted">This browser was set up before sync existed. Enter your recovery code once to turn it on.</span>
+          <span className="small">This browser was set up before sync existed. Enter your recovery code once to turn it on. Deleting a chat here then deletes it in your other browsers too.</span>
           <ErrorFlash error={error} />
           <input className="input mono" value={code} onChange={(e) => setCode(e.target.value)} placeholder="Recovery code" aria-label="Recovery code for sync" />
           <button className="btn primary" disabled={busy || code.trim().length < 20} onClick={() => run(() => session.enableSync(code))}>

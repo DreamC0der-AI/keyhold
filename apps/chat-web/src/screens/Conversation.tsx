@@ -3,7 +3,7 @@ import type { Group } from '@keyhold/chat/index';
 import type { AttachmentRef } from '@keyhold/chat/messages';
 import { describeError, loginFrom, type Convo, type MsgRecord, type PeerInfo, type Session } from '../lib/session';
 import { endedText } from './Home';
-import { Avatar, ErrorFlash, go, Icon, Modal, timeLabel, Tip, useAction } from '../ui';
+import { Avatar, ErrorFlash, go, Icon, Modal, timeLabel, useAction } from '../ui';
 
 const clock = (ts: number) => new Date(ts).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 const msgTime = (ts: number) => (timeLabel(ts) === clock(ts) ? clock(ts) : `${timeLabel(ts)} ${clock(ts)}`);
@@ -93,48 +93,43 @@ export function Conversation({ session, convo }: { session: Session; convo: Conv
   return (
     <>
       <div className="convo-head">
-        <a href="#/" className="btn icon ghost mobile-only" aria-label="Back to chats">{Icon.back()}</a>
-        <button className="who" onClick={() => setPanel(true)} aria-label={`About ${title}`}>
+        <div className="who">
+          <a href="#/" className="btn icon mobile-only" aria-label="Back to chats">{Icon.back()}</a>
           <Avatar name={title} login={peerAddr ? loginFrom(peerAddr) : undefined} square={!dm} size="lg" />
-          <span className="who-text">
+          <div className="who-text">
             <strong className="convo-title">{title}</strong>
-            <span className="convo-sub">
-              {Icon.lock()}
-              {dm ? (peerAddr ? `@${loginFrom(peerAddr)}` : 'Encrypted') : group ? `${group.members().length} ${group.members().length === 1 ? 'member' : 'members'}` : 'Encrypted'}
-            </span>
-          </span>
-        </button>
+            <div className="convo-sub">
+              {Icon.lock()} End-to-end encrypted
+              {!dm && group && <> · {group.members().length} {group.members().length === 1 ? 'member' : 'members'}</>}
+              {space && <span className="hide-sm"> · <span className="mono">{space.split('/')[1]}</span></span>}
+            </div>
+          </div>
+        </div>
         <div className="convo-actions">
           {dm && peer && <TrustBadge peer={peer} onClick={() => setVerify(peer.address)} />}
-          <button className={`btn icon ghost${panel ? ' on' : ''}`} onClick={() => setPanel((p) => !p)} aria-expanded={panel} aria-haspopup="dialog" data-menu-toggle aria-label="Chat options" title="Chat options">
-            {Icon.dots()}
+          <button className="btn" onClick={() => setPanel((p) => !p)} aria-expanded={panel} aria-label={dm ? 'Details' : 'Members'}>
+            {Icon.people()} <span className="hide-sm">{dm ? 'Details' : 'Members'}</span>
           </button>
         </div>
-        {panel && (
-          <ChatMenu session={session} convo={convo} group={group} peer={peer} onClose={() => setPanel(false)} onVerify={(a) => { setPanel(false); setVerify(a); }} />
-        )}
       </div>
       {peer?.status === 'key-changed' && (
         <div className="flash warn banner">
-          <span><strong>{loginFrom(peer.address)}'s key changed.</strong> <Tip align="start">They may have a new device or reset their account, or someone may be impersonating them. Compare safety numbers before you trust it.</Tip></span>
-          <button className="btn sm" onClick={() => setVerify(peer.address)}>Review</button>
+          <strong>{loginFrom(peer.address)}'s identity key changed.</strong> They may have a new device or reset their account, or someone may be impersonating them. <button className="btn link" onClick={() => setVerify(peer.address)}>Review</button>
         </div>
       )}
       {peerLeft && (
         <div className="flash warn banner">
-          <span><strong>{title} left this chat.</strong></span>
-          {session.isOwner(live!) && <button className="btn danger sm" disabled={busy} onClick={() => confirm(CLOSE_CONFIRM) && run(() => session.closeChat(live!))}>Close chat</button>}
+          <strong>{title} left this chat.</strong> You can't send messages here any more.{' '}
+          {session.isOwner(live!) && <button className="btn danger" disabled={busy} onClick={() => confirm(CLOSE_CONFIRM) && run(() => session.closeChat(live!))}>Close chat</button>}
         </div>
       )}
       {!live && (
         <div className="flash banner">
-          <span>
-            <strong>{group ? 'This chat is no longer available.' : `${last.ended ? endedText(session, last.ended, dm) : 'This chat has ended'}.`}</strong>{' '}
-            <Tip align="start">{group ? "GitHub doesn't let you open it right now. If access comes back, it carries on." : 'Your copy of the messages stays here until you delete it.'}</Tip>
-          </span>
-          <span className="row">
-            {dm && peerAddr && !session.blocked.has(peerAddr) && <button className="btn primary sm" disabled={busy} onClick={startNew}>Start a new chat with {title}</button>}
-            <button className="btn sm" disabled={busy} onClick={() => confirm(DELETE_CONFIRM(dm ? title : undefined)) && run(async () => { await session.deleteHistory(convo.key); go('/'); })}>Delete chat</button>
+          <strong>{group ? 'This chat is no longer available.' : `${last.ended ? endedText(session, last.ended, dm) : 'This chat has ended'}.`}</strong>{' '}
+          {group ? "GitHub doesn't let you open it right now. If access comes back, it carries on. " : 'Your copy of the messages stays here until you delete it. '}
+          <span className="row" style={{ marginTop: 6 }}>
+            {dm && peerAddr && !session.blocked.has(peerAddr) && <button className="btn primary" disabled={busy} onClick={startNew}>Start a new chat with {title}</button>}
+            <button className="btn" disabled={busy} onClick={() => confirm(DELETE_CONFIRM(dm ? title : undefined)) && run(async () => { await session.deleteHistory(convo.key); go('/'); })}>Delete chat</button>
           </span>
         </div>
       )}
@@ -165,18 +160,21 @@ export function Conversation({ session, convo }: { session: Session; convo: Conv
           {sending.map((p) => (
             <div key={p.id} className="msg mine">
               <div className="bubble-line"><div className="bubble pending">{p.body}</div></div>
-              <span className="msg-meta"><span className="spinner sm" /> Sending…</span>
+              <span className="msg-meta"><span className="spinner" style={{ width: 10, height: 10 }} /> Encrypting and sending…</span>
             </div>
           ))}
           {live && !joined && !peerLeft && pending.length > 0 && (
-            <div className="sys">Waiting for {pending.map((a) => '@' + loginFrom(a)).join(', ')} to accept</div>
+            <div className="sys">Waiting for {pending.map((a) => '@' + loginFrom(a)).join(', ')} to accept. You can send messages once someone has joined.</div>
           )}
         </div>
+        {panel && (
+          <Details session={session} convo={convo} group={group} onClose={() => setPanel(false)} onVerify={setVerify} />
+        )}
       </div>
       {live ? (
-        <Composer session={session} group={live} disabledReason={peerLeft ? `${title} left this chat` : !joined ? 'Waiting for them to join…' : undefined} error={err} />
+        <Composer session={session} group={live} disabledReason={peerLeft ? `${title} left this chat` : !joined ? 'Waiting for the other person to join…' : undefined} error={err} />
       ) : (
-        <div className="composer ended">This chat has ended</div>
+        <div className="composer"><div className="composer-foot"><span>This chat has ended. Nothing can be sent here.</span></div></div>
       )}
       {verify && <VerifyModal session={session} address={verify} onClose={() => setVerify(undefined)} />}
     </>
@@ -188,18 +186,18 @@ const QUIT_CONFIRM = 'Quit this chat? You stop receiving messages. Your copy of 
 const DELETE_CONFIRM = (peer?: string) => `Delete this chat's messages from this browser? ${peer ?? 'The other members'} keep${peer ? 's' : ''} their copy.`;
 
 function TrustBadge({ peer, onClick }: { peer: PeerInfo; onClick: () => void }) {
-  if (peer.status === 'none' || peer.status === 'error') return null;
-  if (peer.status === 'key-changed') return <button className="trust warn" aria-label="Key changed" title="Key changed. Review safety numbers." onClick={onClick}>{Icon.shield(false)}</button>;
+  if (peer.status === 'none') return <span className="label">No identity yet</span>;
+  if (peer.status === 'error') return null;
+  if (peer.status === 'key-changed') return <button className="label yellow trust" aria-label="Key changed" title="Key changed" onClick={onClick}>{Icon.shield(false)} <span className="hide-sm">Key changed</span></button>;
   return peer.verified ? (
-    <button className="trust ok" aria-label="Verified" title="Verified" onClick={onClick}>{Icon.shield(true)}</button>
+    <button className="label green trust" aria-label="Verified" title="Verified" onClick={onClick}>{Icon.shield(true)} <span className="hide-sm">Verified</span></button>
   ) : (
-    <button className="trust" aria-label="Unverified. Compare safety numbers" title="Not verified yet. Compare safety numbers." onClick={onClick}>{Icon.shield(false)}</button>
+    <button className="label yellow trust" aria-label="Unverified · compare" title="Not verified yet. Compare safety numbers." onClick={onClick}>{Icon.shield(false)} <span className="hide-sm">Unverified · compare</span></button>
   );
 }
 
 function Message({ m, session, group, showAuthor, first = true, last = true }: { m: MsgRecord; session: Session; group?: Group; showAuthor: boolean; first?: boolean; last?: boolean }) {
-  // Older notes carried a second, explanatory sentence; show only the first.
-  if (m.kind === 'system') return <div className="sys">{m.body?.replace(/\. The chat opens for them when they accept in this app\.$/, '')}</div>;
+  if (m.kind === 'system') return <div className="sys">{m.body}</div>;
   const who = loginFrom(m.from);
   const reactions = Object.entries(m.reactions ?? {});
   const act = (fn: () => Promise<unknown>) => fn().catch((e) => alert(describeError(e)));
@@ -304,38 +302,39 @@ function Composer({ session, group, disabledReason, error }: { session: Session;
     <div className="composer">
       {(sendError || error) && <ErrorFlash error={sendError ?? `Sync problem: ${error}`} />}
       <div className="composer-row">
-        <button className="btn icon ghost round" aria-label="Attach file" title="Attach file" disabled={!!disabledReason || busy} onClick={() => fileRef.current?.click()}>{Icon.clip()}</button>
+        <button className="btn icon" style={{ border: 0, background: 'none' }} aria-label="Attach file" disabled={!!disabledReason || busy} onClick={() => fileRef.current?.click()}>{Icon.clip()}</button>
         <input ref={fileRef} type="file" hidden onChange={(e) => {
           const f = e.target.files?.[0];
           e.target.value = '';
           if (f) void run(() => session.sendFile(group, f));
         }} />
-        <div className="composer-field">
-          <label htmlFor="composer" className="sr">Message</label>
-          <textarea
-            id="composer"
-            ref={taRef}
-            rows={1}
-            value={text}
-            placeholder={disabledReason ?? `Message ${session.title(group)}`}
-            disabled={!!disabledReason}
-            onChange={(e) => setText(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
-                e.preventDefault();
-                send();
-              }
-            }}
-          />
-        </div>
-        <button className="btn send round" onClick={send} disabled={!!disabledReason || !text.trim()} aria-label="Send" title="Send (Enter). Shift+Enter for a new line">{Icon.send()}</button>
+        <label htmlFor="composer" className="sr">Message</label>
+        <textarea
+          id="composer"
+          ref={taRef}
+          rows={1}
+          value={text}
+          placeholder={disabledReason ?? `Message ${session.title(group)}`}
+          disabled={!!disabledReason}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+              e.preventDefault();
+              send();
+            }
+          }}
+        />
+        <button className="btn primary" onClick={send} disabled={!!disabledReason || !text.trim()}>Send</button>
+      </div>
+      <div className="composer-foot">
+        <span>Encrypted in this browser before it's saved to GitHub</span>
+        <span className="hide-sm">Enter to send · Shift+Enter for a new line</span>
       </div>
     </div>
   );
 }
 
-/** The ⋯ overlay: who is in the chat and what you can do with it. A popover on wide screens, a sheet on phones. */
-function ChatMenu({ session, convo, group, peer: peerInfo, onClose, onVerify }: { session: Session; convo: Convo; group?: Group; peer?: PeerInfo; onClose: () => void; onVerify: (a: string) => void }) {
+function Details({ session, convo, group, onClose, onVerify }: { session: Session; convo: Convo; group?: Group; onClose: () => void; onVerify: (a: string) => void }) {
   const dm = convo.dm;
   const members = group?.members() ?? [];
   const iAmAdmin = !!group && group.policy.admins.includes(session.identity!.fingerprint);
@@ -347,143 +346,81 @@ function ChatMenu({ session, convo, group, peer: peerInfo, onClose, onVerify }: 
   const peer = convo.peer;
   const blocked = !!peer && session.blocked.has(peer);
   const owner = !!live && session.isOwner(live);
-  const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    const k = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
-    // Close on a click anywhere else (the chat list keeps working while it's open).
-    const out = (e: PointerEvent) => {
-      const t = e.target as Element | null;
-      if (!t?.closest?.('.chat-menu, [data-menu-toggle], .modal-back')) onClose();
-    };
-    addEventListener('keydown', k);
-    addEventListener('pointerdown', out);
-    ref.current?.focus();
-    return () => {
-      removeEventListener('keydown', k);
-      removeEventListener('pointerdown', out);
-    };
-  }, [onClose]);
-  const others = members.filter((m) => m.address !== session.address);
   return (
-    <>
-      <div className="menu-back" />
-      <div className="chat-menu" role="dialog" aria-label={`${convo.title} options`} ref={ref} tabIndex={-1}>
-        <div className="menu-head">
-          <Avatar name={convo.title} login={peer ? loginFrom(peer) : undefined} square={!dm} size="xl" />
-          <div className="menu-title">
-            <strong>{convo.title}</strong>
-            <span className="small muted">{dm ? (peer ? `@${loginFrom(peer)}` : '') : `${members.length} ${members.length === 1 ? 'member' : 'members'}`}</span>
-          </div>
-          <button className="btn icon ghost" onClick={onClose} aria-label="Close options">{Icon.close()}</button>
-        </div>
-        <ErrorFlash error={error} />
-
-        {dm ? (
-          peer && peerInfo && peerInfo.status !== 'none' && peerInfo.status !== 'error' && (
-            <div className="menu-group">
-              <button className="menu-item" onClick={() => onVerify(peer)}>
-                <span className={`menu-ico${peerInfo.verified ? ' ok' : peerInfo.status === 'key-changed' ? ' warn' : ''}`}>{Icon.shield(!!peerInfo.verified)}</span>
-                <span className="grow">{peerInfo.status === 'key-changed' ? 'Key changed: review' : peerInfo.verified ? 'Verified' : 'Verify safety number'}</span>
-                <span className="small muted">{others[0] ? `${others[0].devices.length} ${others[0].devices.length === 1 ? 'device' : 'devices'}` : ''}</span>
-              </button>
-            </div>
-          )
-        ) : (
-          <>
-            {iAmAdmin && live && (
-              <form className="menu-inline" onSubmit={(e) => { e.preventDefault(); void run(() => session.rename(live, name.trim())); }}>
-                <label className="sr" htmlFor="group-name">Group name</label>
-                <input id="group-name" className="input" value={name} onChange={(e) => setName(e.target.value)} placeholder="Group name" />
-                <button className="btn sm" disabled={busy || !name.trim() || name.trim() === live.name}>Rename</button>
-              </form>
-            )}
-            <div className="section-label">Members</div>
-            <div className="menu-group">
-              {members.map((m) => {
-                const login = loginFrom(m.address);
-                const me = m.address === session.address;
-                return (
-                  <div className="member" key={m.fingerprint}>
-                    <Avatar name={login} login={login} size="sm" />
-                    <div className="grow row" style={{ gap: 6, flexWrap: 'nowrap' }}>
-                      <strong className="ellipsis">{login}</strong>{me && <span className="muted">you</span>}
-                      {m.admin && <span className="label blue">Admin</span>}
-                    </div>
-                    {!me && <button className="btn link small" onClick={() => onVerify(m.address)}>Verify</button>}
-                    {!me && iAmAdmin && live && (
-                      <button className="btn danger sm" disabled={busy} onClick={() => confirm(`Remove ${login} from the group? Keys rotate right away.`) && run(() => session.removeMember(live, m.fingerprint))}>Remove</button>
-                    )}
-                  </div>
-                );
-              })}
-              {pending.map((a) => (
-                <div className="member" key={a}>
-                  <Avatar name={loginFrom(a)} login={loginFrom(a)} size="sm" />
-                  <div className="grow"><strong>{loginFrom(a)}</strong> <span className="small muted">invited</span></div>
+    <aside className="panel" aria-label="Chat details">
+      <div className="panel-head">
+        <h3>{dm ? 'Details' : 'Members'}</h3>
+        <button className="btn icon" onClick={onClose} aria-label="Close panel">{Icon.close()}</button>
+      </div>
+      <ErrorFlash error={error} />
+      {!dm && iAmAdmin && live && (
+        <form className="stack" style={{ gap: 6 }} onSubmit={(e) => { e.preventDefault(); void run(() => session.rename(live, name.trim())); }}>
+          <label className="field">Group name<input className="input" value={name} onChange={(e) => setName(e.target.value)} /></label>
+          <button className="btn" disabled={busy || !name.trim() || name.trim() === live.name}>Rename</button>
+        </form>
+      )}
+      <div>
+        {members.map((m) => {
+          const login = loginFrom(m.address);
+          const me = m.address === session.address;
+          return (
+            <div className="member" key={m.fingerprint}>
+              <Avatar name={login} login={login} size="sm" />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div className="row" style={{ gap: 4 }}>
+                  <strong>{login}</strong>{me && <span className="muted">(you)</span>}
+                  {m.admin && !dm && <span className="label blue">Admin</span>}
                 </div>
-              ))}
+                <div className="small muted">{m.devices.length} {m.devices.length === 1 ? 'device' : 'devices'}</div>
+              </div>
+              {!me && <button className="btn link small" onClick={() => onVerify(m.address)}>Verify</button>}
+              {!me && !dm && iAmAdmin && live && (
+                <button className="btn danger" disabled={busy} onClick={() => confirm(`Remove ${login} from the group? Keys rotate right away.`) && run(() => session.removeMember(live, m.fingerprint))}>Remove</button>
+              )}
             </div>
-            {iAmAdmin && live && (
-              <form className="menu-inline" onSubmit={(e) => { e.preventDefault(); void run(async () => { await session.invite(live, invite); setInvite(''); }); }}>
-                <label className="sr" htmlFor="group-invite">Invite someone</label>
-                <input id="group-invite" className="input" value={invite} onChange={(e) => setInvite(e.target.value)} placeholder="Add by GitHub username" autoComplete="off" />
-                <button className="btn primary sm" disabled={busy || !invite.trim()}>{busy ? <span className="spinner sm" /> : 'Invite'}</button>
-              </form>
-            )}
+          );
+        })}
+        {pending.map((a) => (
+          <div className="member" key={a}>
+            <Avatar name={loginFrom(a)} login={loginFrom(a)} size="sm" />
+            <div style={{ flex: 1 }}><strong>{loginFrom(a)}</strong><div className="small muted">Invited, not joined yet</div></div>
+          </div>
+        ))}
+      </div>
+      {!dm && iAmAdmin && live && (
+        <form className="stack" style={{ gap: 6 }} onSubmit={(e) => { e.preventDefault(); void run(async () => { await session.invite(live, invite); setInvite(''); }); }}>
+          <label className="field">Invite someone<input className="input" value={invite} onChange={(e) => setInvite(e.target.value)} placeholder="GitHub username" autoComplete="off" /></label>
+          <button className="btn primary" disabled={busy || !invite.trim()}>{busy ? <span className="spinner" /> : 'Invite'}</button>
+        </form>
+      )}
+      {group && (
+        <div className="stack small muted" style={{ gap: 6 }}>
+          <span>Stored in <a href={`https://github.com/${group.space}`} target="_blank" rel="noreferrer" className="mono">{group.space}</a>. The files there are ciphertext.</span>
+          <span>Key epoch {String(group.epoch)}. Keys rotate every 7 days or 100 messages, and whenever someone leaves.</span>
+        </div>
+      )}
+      <div className="stack" style={{ gap: 6 }}>
+        {live && owner && (
+          <>
+            <button className="btn danger" disabled={busy} onClick={() => confirm(CLOSE_CONFIRM) && run(() => session.closeChat(live))}>Close chat</button>
+            <span className="small muted">Ends it for everyone and deletes its repo. You started it, so only you can close it.</span>
           </>
         )}
-
-        {group && (
-          <div className="menu-group">
-            <div className="menu-row">
-              <a className="menu-item" href={`https://github.com/${group.space}`} target="_blank" rel="noreferrer">
-                <span className="menu-ico">{Icon.lock()}</span>
-                <span className="grow">Encrypted repo on GitHub</span>
-                <span className="muted">{Icon.external()}</span>
-              </a>
-              <Tip align="end">Messages are stored in <code>{group.space}</code> as ciphertext. Key epoch {String(group.epoch)}; keys rotate every 7 days or 100 messages, and whenever someone leaves.</Tip>
-            </div>
-          </div>
+        {live && !owner && (
+          <>
+            <button className="btn danger" disabled={busy} onClick={() => confirm(QUIT_CONFIRM) && run(() => session.quitChat(live))}>Quit chat</button>
+            <span className="small muted">You leave; {dm ? `${convo.title} keeps` : 'the others keep'} the chat.</span>
+          </>
         )}
-
-        <div className="menu-group">
-          <div className="menu-row">
-            <button className="menu-item" disabled={busy} onClick={() => confirm(DELETE_CONFIRM(dm ? convo.title : undefined)) && run(async () => { await session.deleteHistory(convo.key); onClose(); if (!live) go('/'); })}>
-              <span className="menu-ico">{Icon.trash()}</span>
-              <span className="grow">Delete chat</span>
-            </button>
-            <Tip align="end">Deletes the messages in this browser only.{live ? ' The chat stays open.' : ''}</Tip>
-          </div>
-          {live && owner && (
-            <div className="menu-row">
-              <button className="menu-item danger" disabled={busy} onClick={() => confirm(CLOSE_CONFIRM) && run(async () => { await session.closeChat(live); onClose(); })}>
-                <span className="menu-ico">{Icon.close()}</span>
-                <span className="grow">Close chat</span>
-              </button>
-              <Tip align="end">Ends it for everyone and deletes its repo. You started it, so only you can close it.</Tip>
-            </div>
-          )}
-          {live && !owner && (
-            <div className="menu-row">
-              <button className="menu-item danger" disabled={busy} onClick={() => confirm(QUIT_CONFIRM) && run(async () => { await session.quitChat(live); onClose(); })}>
-                <span className="menu-ico">{Icon.leave()}</span>
-                <span className="grow">Quit chat</span>
-              </button>
-              <Tip align="end">You leave; {dm ? `${convo.title} keeps` : 'the others keep'} the chat.</Tip>
-            </div>
-          )}
-          {dm && peer && (blocked ? (
-            <button className="menu-item" disabled={busy} onClick={() => run(() => session.unblock(peer))}>
-              <span className="menu-ico">{Icon.block()}</span><span className="grow">Unblock {convo.title}</span>
-            </button>
-          ) : (
-            <button className="menu-item danger" disabled={busy} onClick={() => confirm(`Block ${convo.title}? ${live ? (owner ? 'This chat is closed, and ' : 'You quit this chat, and ') : ''}their invitations are turned down without asking you.`) && run(() => session.block(peer))}>
-              <span className="menu-ico">{Icon.block()}</span><span className="grow">Block {convo.title}</span>
-            </button>
-          ))}
-        </div>
+        <button className="btn" disabled={busy} onClick={() => confirm(DELETE_CONFIRM(dm ? convo.title : undefined)) && run(async () => { await session.deleteHistory(convo.key); if (!live) go('/'); })}>Delete chat</button>
+        <span className="small muted">Deletes the messages in this browser only.{live ? ' The chat stays open.' : ''}</span>
+        {dm && peer && (blocked ? (
+          <button className="btn" disabled={busy} onClick={() => run(() => session.unblock(peer))}>Unblock {convo.title}</button>
+        ) : (
+          <button className="btn danger" disabled={busy} onClick={() => confirm(`Block ${convo.title}? ${live ? (owner ? 'This chat is closed, and ' : 'You quit this chat, and ') : ''}their invitations are turned down without asking you.`) && run(() => session.block(peer))}>Block {convo.title}</button>
+        ))}
       </div>
-    </>
+    </aside>
   );
 }
 
