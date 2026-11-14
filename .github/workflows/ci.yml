@@ -15,4 +15,5 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
-      - run: npx playwright@1 install --with-deps chromium && npm i --no-save playwright@1 && npm run test:browser
+      # Install the package first, then the browser build that exact version expects.
+      - run: npm i --no-save playwright@1 && npx playwright install --with-deps chromium && npm run test:browser
