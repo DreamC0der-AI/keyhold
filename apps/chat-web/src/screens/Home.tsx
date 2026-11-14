@@ -180,6 +180,7 @@ function StatusBar({ session }: { session: Session }) {
         {err ? `Sync problem: ${err}` : 'Up to date'}
         {session.rateRemaining !== undefined && ` · ${session.rateRemaining.toLocaleString()} GitHub requests left this hour`}
       </span>
+      {!session.syncOn && <a href="#/settings" className="small" style={{ whiteSpace: 'nowrap' }}>Turn on sync</a>}
     </div>
   );
 }

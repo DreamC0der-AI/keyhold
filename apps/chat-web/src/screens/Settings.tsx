@@ -56,6 +56,8 @@ export function Settings({ session }: { session: Session }) {
             </div>
           </section>
 
+          <SyncBox session={session} />
+
           {session.blocked.size > 0 && (
             <section className="box">
               <div className="box-header"><h3>Blocked</h3></div>
@@ -127,5 +129,34 @@ function ResetModal({ session, onClose }: { session: Session; onClose: () => voi
         {busy ? <span className="spinner" /> : 'Delete and start over'}
       </button>
     </Modal>
+  );
+}
+
+function SyncBox({ session }: { session: Session }) {
+  const [code, setCode] = useState('');
+  const { busy, error, run } = useAction();
+  return (
+    <section className="box">
+      <div className="box-header row" style={{ justifyContent: 'space-between' }}>
+        <h3>Sync across browsers</h3>
+        {session.syncOn ? <span className="label green">On</span> : <span className="label">Off</span>}
+      </div>
+      {session.syncOn ? (
+        <div className="box-row small">
+          Your chat list, deleted chats, closed chats, read marks, blocks and declined invitations are kept, encrypted, in{' '}
+          <span className="mono">{session.login}/{session.homeRepo}</span>. Your other browsers apply them within about a minute.
+          {session.syncError && <div className="flash warn" style={{ marginTop: 8 }}>Sync problem: {session.syncError}</div>}
+        </div>
+      ) : (
+        <div className="box-row stack">
+          <span className="small">This browser was set up before sync existed. Enter your recovery code once to turn it on. Deleting a chat here then deletes it in your other browsers too.</span>
+          <ErrorFlash error={error} />
+          <input className="input mono" value={code} onChange={(e) => setCode(e.target.value)} placeholder="Recovery code" aria-label="Recovery code for sync" />
+          <button className="btn primary" disabled={busy || code.trim().length < 20} onClick={() => run(() => session.enableSync(code))}>
+            {busy ? <span className="spinner" /> : 'Turn on sync'}
+          </button>
+        </div>
+      )}
+    </section>
   );
 }

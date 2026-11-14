@@ -284,6 +284,35 @@ describe('personal synced store (box 12) and root backup (box 9)', () => {
     await expect(PersonalData.open(p.personal, other, 'x')).rejects.toMatchObject({ code: 'decrypt_failed' });
   });
 
+  it.each(worlds)('concurrent edits never fork: max, once and last-writer rules converge (%s)', async (_n, make) => {
+    const w = make();
+    const p = w.session('alice');
+    const K = await k();
+    const laptop = await PersonalData.open(p.personal, K, 'laptop');
+    const phone = await PersonalData.open(p.personal, K, 'phone');
+    const rules = { clearedAt: 'max', ended: 'once' } as const;
+    // Both edit the same chat before seeing each other's change.
+    await laptop.set('chats', 'g1', { clearedAt: 500, ended: { how: 'closed' }, name: 'laptop' }, rules);
+    await phone.set('chats', 'g1', { clearedAt: 300, ended: { how: 'quit' }, name: 'phone' }, rules);
+    await phone.flush();
+    await laptop.flush();
+    const a = await laptop.get('chats', 'g1');
+    const b = await phone.get('chats', 'g1');
+    expect(a).toEqual(b);
+    expect(a!.clearedAt).toBe(500); // marks only move forward
+    expect(a!.ended).toEqual({ how: 'closed' }); // the first ending stays (the laptop's was set first)
+    // A later lower mark, or an attempt to clear the tombstone, changes nothing.
+    await laptop.set('chats', 'g1', { clearedAt: 100, ended: undefined }, rules);
+    await laptop.flush();
+    expect(await phone.get('chats', 'g1')).toMatchObject({ clearedAt: 500, ended: { how: 'closed' } });
+    // changes(): everything first, then only what changed
+    expect((await phone.changes()).map((c) => c.key)).toContain('g1');
+    expect(await phone.changes()).toEqual([]);
+    await laptop.set('blocks', 'github:eve', { blocked: true });
+    await laptop.flush();
+    expect(await phone.changes()).toEqual([{ collection: 'blocks', key: 'github:eve', value: { blocked: true } }]);
+  });
+
   it('history backup restores on a new device', async () => {
     const w = new MemoryWorld();
     const K = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);

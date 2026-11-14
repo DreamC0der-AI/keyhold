@@ -20,6 +20,8 @@ import {
   fingerprint,
   backupRootKey,
   restoreRootKey,
+  PersonalData,
+  type MergeRule,
   type DeviceIdentity,
   type Group,
   type GroupEvent,
@@ -31,7 +33,7 @@ import {
 import type { AttachmentRef } from '@keyhold/chat/messages';
 import { sha256, toHex } from '@keyhold/util/bytes';
 import { generateRecoveryCode, parseRecoveryCode } from '@keyhold/keys/recovery';
-import { hkdfAesKey } from '@keyhold/util/hkdf';
+import { hkdfAesKey, hkdfBytes } from '@keyhold/util/hkdf';
 import { CONFIG, installUrl } from '../config';
 import { currentToken, type AuthState } from './auth';
 import { Db, IdbPinStore, idbDevice } from './idb';
@@ -76,6 +78,8 @@ export interface ChatRecord {
   clearedAt?: number;
   /** DM owner side: the other person quit. */
   peerLeft?: boolean;
+  /** Ended and deleted: nothing of it is shown or kept, only this tombstone. */
+  purged?: boolean;
 }
 
 /** What the chat list shows: a DM is one entry per person, whatever rooms it went through. */
@@ -130,6 +134,11 @@ export interface PeerInfo {
 }
 
 const ROOT_BACKUP_INFO = 'keyhold-chat-web/v1/root-backup';
+/** The account key K for the personal store in the home repo, derived from the root key. */
+const PERSONAL_KEY_INFO = 'keyhold-chat-web/v1/personal-store';
+const PERSONAL_KEY_SLOT = 'chat-web/personal-key';
+/** What each synced chat field does when two browsers change it at once. */
+const CHAT_RULES: Record<string, MergeRule> = { space: 'once', kind: 'once', peer: 'once', name: 'once', createdAt: 'once', ended: 'once', clearedAt: 'max', peerLeft: 'once', purged: 'once' };
 const ACTIVE_POLL_MS = 4_000;
 const IDLE_POLL_MS = 20_000;
 const WARM_POLL_MS = 6_000;
@@ -195,6 +204,13 @@ export class Session {
   /** Rooms to end once the current sync is done (a close arrived while syncing). */
   private toEnd = new Map<string, NonNullable<ChatRecord['ended']>>();
   private userIds = new Map<string, Promise<number | undefined>>();
+  /** Chat list, marks, blocks and declines shared by all this account's browsers (home repo). */
+  personal?: PersonalData;
+  syncError?: string;
+  private pushed = new Map<string, string>();
+  private lastPull = 0;
+  private lastFullPull = 0;
+  private lastFlush = 0;
   private lastClosures = 0;
   private peers = new Map<string, Promise<PeerInfo>>();
 
@@ -351,6 +367,7 @@ export class Session {
       // Back up first, so there is never a published identity without a way back in.
       await backupRootKey(this.provider.vault, await this.recoveryKey(code.bytes), this.address, root);
       const id = await createDeviceIdentity(this.device, root, this.address, newDeviceId());
+      await this.saveSyncKey(root);
       try {
         await new DirectoryWriter(this.provider.directory, this.address).publish(root, id.cert, { name: this.login });
       } catch (e) {
@@ -386,11 +403,34 @@ export class Session {
     return root;
   }
 
+  private async saveSyncKey(root: RootKey) {
+    const raw = await hkdfBytes(root.secretKey, PERSONAL_KEY_INFO);
+    await this.device.keystore.put(PERSONAL_KEY_SLOT, raw);
+    raw.fill(0);
+  }
+
+  /** Browsers set up before sync existed: the recovery code unlocks the key once. */
+  async enableSync(codeText: string) {
+    const root = await this.unlockRoot(codeText);
+    try {
+      await this.saveSyncKey(root);
+    } finally {
+      wipeRoot(root);
+    }
+    await this.startSync();
+    this.bump();
+  }
+
+  get syncOn() {
+    return !!this.personal;
+  }
+
   /** Add this browser as a new device of an existing identity. */
   async restoreIdentity(codeText: string) {
     const root = await this.unlockRoot(codeText);
     try {
       const id = await createDeviceIdentity(this.device, root, this.address, newDeviceId());
+      await this.saveSyncKey(root);
       try {
         await new DirectoryWriter(this.provider.directory, this.address).addDevice(root, id.cert);
       } catch (e) {
@@ -457,6 +497,7 @@ export class Session {
     for (const g of this.chat.groups.values()) this.fill(g);
     for (const k of await this.db.keys('kv', 'declined:')) this.declined.add(k.slice('declined:'.length));
     for (const k of await this.db.keys('kv', 'block:')) this.blocked.add(k.slice('block:'.length));
+    await this.startSync().catch((e) => (this.syncError = describeError(e)));
     this.phase = 'ready';
     void this.loop();
   }
@@ -471,7 +512,120 @@ export class Session {
     return r;
   }
   private saveRecord(r: ChatRecord) {
+    this.push(r);
     return this.db.put('kv', r, `chat:${r.groupId}`);
+  }
+
+  // ---- sync across this account's browsers (personal store in the home repo) ----
+
+  private async startSync() {
+    if (this.personal) return;
+    const raw = await this.device.keystore.get(PERSONAL_KEY_SLOT);
+    if (!raw) return;
+    const key = await crypto.subtle.importKey('raw', raw as Uint8Array<ArrayBuffer>, 'AES-GCM', false, ['encrypt', 'decrypt']);
+    this.personal = await PersonalData.open(this.provider.personal, key, this.identity!.deviceId);
+    // Everything this browser knows goes up once; merging makes repeats harmless.
+    for (const r of this.records.values()) this.push(r);
+    for (const a of this.blocked) await this.personal.set('blocks', a, { blocked: true });
+    for (const sp of this.declined) await this.personal.set('settings', `declined:${sp}`, { value: true }, { value: 'once' });
+    await this.pull();
+    await this.personal.flush();
+  }
+
+  /** Queue the synced fields of a chat, if they changed since last time. */
+  private push(r: ChatRecord) {
+    if (!this.personal) return;
+    const fields: Record<string, unknown> = {
+      space: r.space, kind: r.kind, peer: r.peer, name: r.lastName, createdAt: r.createdAt,
+      ended: r.ended, clearedAt: r.clearedAt, peerLeft: r.peerLeft || undefined, purged: r.purged || undefined,
+    };
+    for (const k of Object.keys(fields)) if (fields[k] === undefined) delete fields[k];
+    const snap = JSON.stringify(fields);
+    if (this.pushed.get(r.groupId) !== snap) {
+      this.pushed.set(r.groupId, snap);
+      void this.personal.set('chats', r.groupId, fields, CHAT_RULES);
+    }
+    // Read up to here: other browsers clear their unread count.
+    if (!r.unread) {
+      const mark = `read:${r.lastTs}`;
+      if (this.pushed.get(`r/${r.groupId}`) !== mark) {
+        this.pushed.set(`r/${r.groupId}`, mark);
+        void this.personal.set('readMarks', r.groupId, { at: r.lastTs }, { at: 'max' });
+      }
+    }
+  }
+
+  /** Apply what other browsers wrote. */
+  private async pull() {
+    if (!this.personal) return;
+    for (const ch of await this.personal.changes()) {
+      const v = ch.value;
+      if (ch.collection === 'chats') await this.applyChat(ch.key, v);
+      else if (ch.collection === 'readMarks') {
+        const r = this.records.get(ch.key);
+        if (r && typeof v.at === 'number' && v.at >= r.lastTs && r.unread) {
+          r.unread = 0;
+          await this.saveRecord(r);
+        }
+      } else if (ch.collection === 'blocks') {
+        if (v.blocked) {
+          if (!this.blocked.has(ch.key)) {
+            this.blocked.add(ch.key);
+            await this.db.put('kv', Date.now(), `block:${ch.key}`);
+          }
+        } else if (this.blocked.delete(ch.key)) await this.db.del('kv', `block:${ch.key}`);
+      } else if (ch.collection === 'settings' && ch.key.startsWith('declined:') && v.value) {
+        const sp = ch.key.slice('declined:'.length);
+        if (!this.declined.has(sp)) {
+          this.declined.add(sp);
+          await this.db.put('kv', Date.now(), `declined:${sp}`);
+        }
+      }
+    }
+    this.bump();
+  }
+
+  private async applyChat(groupId: string, v: Record<string, unknown>) {
+    let r = this.records.get(groupId);
+    if (!r) {
+      r = { groupId, invited: [], createdAt: (v.createdAt as number) ?? Date.now(), lastTs: (v.createdAt as number) ?? 0, unread: 0 };
+      this.records.set(groupId, r);
+    }
+    for (const f of ['space', 'kind', 'peer'] as const) if (!r[f] && v[f]) (r as unknown as Record<string, unknown>)[f] = v[f];
+    if (!r.lastName && typeof v.name === 'string') r.lastName = v.name;
+    if (typeof v.createdAt === 'number' && v.createdAt < r.createdAt) r.createdAt = v.createdAt;
+    if (v.peerLeft) r.peerLeft = true;
+    if (typeof v.clearedAt === 'number' && v.clearedAt > (r.clearedAt ?? 0)) await this.applyClear(r, v.clearedAt);
+    if (v.ended && !r.ended) {
+      r.ended = v.ended as ChatRecord['ended'];
+      await this.chat!.groups.get(groupId)?.end();
+    }
+    if (v.purged && !r.purged) await this.purgeRoom(r);
+    // Already in step with storage: don't echo it back.
+    await this.db.put('kv', r, `chat:${r.groupId}`);
+  }
+
+  /** Delete chat up to a time: this browser's messages up to then go, and never come back. */
+  private async applyClear(r: ChatRecord, at: number) {
+    r.clearedAt = Math.max(r.clearedAt ?? 0, at);
+    await this.db.deleteMessages(r.groupId, at);
+    if (r.lastTs <= at) {
+      r.lastText = undefined;
+      r.unread = 0;
+    }
+  }
+
+  /** An ended room deleted: drop what's left of it here and keep only a tombstone. */
+  private async purgeRoom(r: ChatRecord) {
+    r.purged = true;
+    await this.db.deleteMessages(r.groupId);
+    await this.chat!.purge(r.groupId);
+    // If GitHub still lists the repo for a while, it must not come back as an invitation.
+    if (r.space && !this.declined.has(r.space)) {
+      this.declined.add(r.space);
+      await this.db.put('kv', Date.now(), `declined:${r.space}`);
+      await this.personal?.set('settings', `declined:${r.space}`, { value: true }, { value: 'once' });
+    }
   }
 
   /** Keep what a room needs for display after its group state is gone. */
@@ -504,7 +658,7 @@ export class Session {
     for (const g of this.chat.groups.values()) this.fill(g);
     const by = new Map<string, ChatRecord[]>();
     for (const r of this.records.values()) {
-      if (r.hidden) continue;
+      if (r.hidden || r.purged) continue;
       const g = this.chat.groups.get(r.groupId);
       if (!g && !r.ended) continue;
       const k = this.convoKey(r);
@@ -788,24 +942,10 @@ export class Session {
     if (!c) return;
     const now = Date.now();
     for (const r of c.rooms) {
-      await this.db.deleteMessages(r.groupId);
+      await this.applyClear(r, now);
       const g = this.chat!.groups.get(r.groupId);
-      if (g && g.active) {
-        r.clearedAt = now;
-        r.lastText = undefined;
-        r.unread = 0;
-        await this.saveRecord(r);
-      } else {
-        await this.chat!.purge(r.groupId);
-        // If GitHub still lists the repo for a while (the owner's app hasn't removed us yet), it
-        // must not come back as an invitation.
-        if (r.space) {
-          this.declined.add(r.space);
-          await this.db.put('kv', now, `declined:${r.space}`);
-        }
-        this.records.delete(r.groupId);
-        await this.db.del('kv', `chat:${r.groupId}`);
-      }
+      if (!g || !g.active) await this.purgeRoom(r);
+      await this.saveRecord(r);
     }
     this.bump();
   }
@@ -813,6 +953,7 @@ export class Session {
   async block(address: string) {
     this.blocked.add(address);
     await this.db.put('kv', Date.now(), `block:${address}`);
+    await this.personal?.set('blocks', address, { blocked: true });
     const c = this.liveDm(address);
     if (c?.live) {
       if (this.isOwner(c.live)) await this.closeChat(c.live);
@@ -825,6 +966,7 @@ export class Session {
   async unblock(address: string) {
     this.blocked.delete(address);
     await this.db.del('kv', `block:${address}`);
+    await this.personal?.set('blocks', address, { blocked: undefined });
     this.bump();
   }
 
@@ -900,7 +1042,7 @@ export class Session {
       return;
     }
     // Delete chat: never show what was deleted again, even though old keys may still open it.
-    if (r.clearedAt && msg.ts <= r.clearedAt) return;
+    if (r.purged || (r.clearedAt && msg.ts <= r.clearedAt)) return;
     const touch = async (preview: string) => {
       r.lastTs = Math.max(r.lastTs, msg.ts);
       r.lastText = preview;
@@ -1039,7 +1181,7 @@ export class Session {
       }
       // Both of us started a DM at once (case 25): I asked to chat with them, so take theirs too.
       // Rule 2 then keeps one of the two rooms.
-      if (!inv.space && this.ownPendingDm(inv.from)) await this.acceptInvite(inv.key).catch(() => undefined);
+      if (!inv.space && this.ownPendingDm(inv.from)) await this.acceptInvite(inv.key, true).catch(() => undefined);
     }
     // Listing every repo the app can see costs a few requests: do it when asked, while something
     // is pending, or once a minute.
@@ -1056,7 +1198,8 @@ export class Session {
         // Accepted here: an accepted notice from the same person is this repo. Our own repo means
         // another of our devices made the chat. Anything else was accepted outside this app
         // (on github.com), so it still waits for Accept here.
-        let accepted = owner === this.login.toLowerCase();
+        // Also a chat another of our browsers already joined (from the synced chat list).
+        let accepted = owner === this.login.toLowerCase() || [...this.records.values()].some((r) => r.space === space && !r.ended && !r.purged);
         for (const [k, v] of this.invites) {
           if (k.startsWith('notice:') && v.status !== 'invited' && v.from === from) {
             this.invites.delete(k);
@@ -1107,7 +1250,7 @@ export class Session {
   }
 
   /** The user accepted: accept the GitHub invitation, then join the chat. */
-  async acceptInvite(key: string) {
+  async acceptInvite(key: string, auto = false) {
     const inv = this.invites.get(key);
     if (!inv || inv.status !== 'invited') return;
     const p = this.provider;
@@ -1125,7 +1268,9 @@ export class Session {
     await this.checkInvites(true);
     // Already accepted elsewhere shows up as a repo in that scan; if nothing did, it's gone.
     const still = this.invites.get(key);
-    if (still && gone) Object.assign(still, { status: 'error', error: `@${loginFrom(inv.from)} withdrew this invitation or closed the chat.` });
+    // Taken by the app itself (both started a DM at once) and already retired: nothing to say.
+    if (still && gone && auto) this.invites.delete(key);
+    else if (still && gone) Object.assign(still, { status: 'error', error: `@${loginFrom(inv.from)} withdrew this invitation or closed the chat.` });
     this.bump();
   }
 
@@ -1149,6 +1294,7 @@ export class Session {
     if (inv.space) {
       this.declined.add(inv.space);
       await this.db.put('kv', Date.now(), `declined:${inv.space}`);
+      await this.personal?.set('settings', `declined:${inv.space}`, { value: true }, { value: 'once' });
     }
     this.invites.delete(key);
     this.bump();
@@ -1235,6 +1381,7 @@ export class Session {
       await this.checkClosures().catch(() => undefined);
     }
     await this.resolveDuplicates().catch(() => undefined);
+    await this.syncPersonal(now, hidden);
     for (const g of this.chat.groups.values()) {
       if (!g.active) continue;
       const rec = this.records.get(g.id);
@@ -1255,6 +1402,29 @@ export class Session {
       } catch (e) {
         this.groupErrors.set(g.id, describeError(e));
       }
+    }
+  }
+
+  /** Write queued changes soon after they happen; read other browsers' when the home repo changed. */
+  private async syncPersonal(now: number, hidden: boolean) {
+    const p = this.personal;
+    if (!p) return;
+    try {
+      if (p.pending && now - this.lastFlush > 2_000) {
+        this.lastFlush = now;
+        await p.flush();
+      }
+      if (now - this.lastPull > (hidden ? HIDDEN_POLL_MS : 8_000)) {
+        this.lastPull = now;
+        // GitHub's change check can lag a minute, so read anyway every half minute.
+        if ((await this.headChanged(`${this.login}/${this.homeRepo}`)) || now - this.lastFullPull > 30_000) {
+          this.lastFullPull = now;
+          await this.pull();
+        }
+      }
+      this.syncError = undefined;
+    } catch (e) {
+      this.syncError = describeError(e);
     }
   }
 

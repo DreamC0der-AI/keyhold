@@ -178,6 +178,7 @@ try {
   check(!(await dave.page.getByText('carol invited you').count()) && !(await dave.page.locator('.chat-item', { hasText: 'carol' }).count()), `dave declined carol's invitation and it stayed gone (open GitHub invitations: ${Array.isArray(invs) ? invs.length : '?'})`);
 
   const openChat = async (p, name) => {
+    await p.page.evaluate(() => { if (location.hash.startsWith('#/settings')) location.hash = '#/'; });
     await p.page.locator('.chat-item', { hasText: name }).first().click();
     await p.page.waitForTimeout(300);
   };
@@ -202,6 +203,9 @@ try {
   await alice.page.locator('aside.panel').getByRole('button', { name: 'Close chat' }).click();
   await alice.page.locator('.sys.divider', { hasText: 'You closed this chat' }).waitFor({ timeout: 30000 });
   await bob.page.locator('.sys.divider', { hasText: '@alice closed this chat' }).waitFor({ timeout: 45000 });
+  await openChat(alice2, 'bob');
+  await alice2.page.locator('.sys.divider', { hasText: 'You closed this chat' }).waitFor({ timeout: 45000 });
+  check(true, "alice's second browser shows the close too");
   check(await bubble(bob, 'after the clear').count() > 0 && (await bob.page.locator('#composer').count()) === 0, 'bob sees "@alice closed this chat", keeps his copy, and can\'t send');
   await bob.page.screenshot({ path: `${SHOTS}/closed-bob.png` });
   await bob.page.getByRole('button', { name: 'Start a new chat with alice' }).click();
@@ -214,6 +218,24 @@ try {
   check(await alice.page.locator('.sys.divider', { hasText: 'new chat started' }).count() > 0 && (await bubble(alice, 'after the clear').count()) > 0, 'old history above a divider, then the new room');
   await alice.page.screenshot({ path: `${SHOTS}/recreated-alice.png` });
 
+  // Delete chat syncs to alice's other browser
+  // (her second browser joins the new room by itself, from the synced chat list; it can only
+  // read what is sent after it joined)
+  await openChat(alice2, 'bob');
+  await alice2.page.locator('#composer:enabled').waitFor({ timeout: 60000 });
+  await alice2.page.waitForTimeout(3000);
+  await sendMsg(bob, 'for both browsers');
+  await bubble(alice2, 'for both browsers').waitFor({ timeout: 60000 });
+  await bubble(alice, 'for both browsers').waitFor({ timeout: 60000 });
+  await details(alice);
+  await alice.page.locator('aside.panel').getByRole('button', { name: 'Delete chat' }).click();
+  await bubble(alice, 'for both browsers').waitFor({ state: 'detached', timeout: 10000 });
+  await bubble(alice2, 'for both browsers').waitFor({ state: 'detached', timeout: 60000 });
+  check((await count(alice2, 'bob')) === 1 && !(await bubble(alice2, 'after the clear').count()), "alice's delete reached her second browser; the chat stays");
+  await sendMsg(bob, 'still here after alice cleared');
+  await bubble(alice2, 'still here after alice cleared').waitFor({ timeout: 45000 });
+  check(true, 'new messages still arrive on both of her browsers');
+
   // Quit: dave (not the owner) quits; alice sees he left, can't send, and closes
   await openChat(dave, 'alice');
   await details(dave);
@@ -225,12 +247,25 @@ try {
   await alice.page.locator('.banner').getByRole('button', { name: 'Close chat' }).click();
   await alice.page.locator('.sys.divider', { hasText: 'You closed this chat' }).waitFor({ timeout: 30000 });
   check(true, 'alice closed the chat dave quit');
+  // Deleting an ended chat removes it from her other browser's list too
+  await details(alice);
+  await alice.page.locator('aside.panel').getByRole('button', { name: 'Delete chat' }).click();
+  await alice.page.waitForTimeout(500);
+  check((await count(alice, 'dave')) === 0, 'ended chat deleted from the list');
+  let gone = false;
+  for (let i = 0; i < 20 && !gone; i++) {
+    gone = (await count(alice2, 'dave')) === 0;
+    if (!gone) await alice2.page.waitForTimeout(3000);
+  }
+  check(gone, "and from alice's second browser");
 
   // Block: dave blocks alice; her next invitation is turned down without asking
   await details(dave);
   await dave.page.locator('aside.panel').getByRole('button', { name: 'Block alice' }).click();
   await dave.page.locator('aside.panel').getByRole('button', { name: 'Unblock alice' }).waitFor();
-  await alice.page.getByRole('button', { name: 'Start a new chat with dave' }).click();
+  await alice.page.getByRole('button', { name: 'New chat' }).first().click();
+  await alice.page.getByLabel('GitHub username').fill('dave');
+  await alice.page.getByRole('button', { name: 'Start chat' }).click();
   await alice.page.locator('.sys', { hasText: 'Invitation sent to @dave' }).waitFor({ timeout: 30000 });
   await dave.page.waitForTimeout(25000);
   check(!(await dave.page.getByText('alice invited you').count()), 'blocked person\'s invitation never shows');

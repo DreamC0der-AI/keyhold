@@ -5,7 +5,11 @@
  * - Every item is sealed with the account key K (keyhold/crypto), bound to its opaque id.
  * - Ids are HMACs of the logical key under an index key that is itself sealed with K, so the
  *   storage can't tell a contact from a read mark, or count your contacts by name.
- * - Concurrent edits merge per field, last writer wins (hybrid clock, device id breaks ties).
+ * - Concurrent edits merge per field, so devices never fork: whatever order writes land in,
+ *   every device ends up with the same record. Each field has a merge rule: last writer wins
+ *   (default; hybrid clock, device id breaks ties), `max` (the larger number wins, for marks
+ *   that only move forward), or `once` (the first value set wins and can't be cleared, for
+ *   tombstones such as "this chat ended").
  *   Writes are queued and flushed in one pass, so frequent changes (read marks) cost one write
  *   per item per flush.
  */
@@ -18,10 +22,13 @@ import { mayBackUp } from '../storage/requirements.js';
 import type { Pin, PinStore } from './identity.js';
 
 type Stamp = { t: number; d: string };
+/** How concurrent values of one field combine. */
+export type MergeRule = 'lww' | 'max' | 'once';
+type Field = { v: unknown; t: number; d: string; m?: MergeRule };
 interface Item {
   c: string;
   k: string;
-  f: Record<string, { v: unknown; t: number; d: string }>;
+  f: Record<string, Field>;
 }
 
 export type Collection = 'contacts' | 'chats' | 'readMarks' | 'blocks' | 'settings' | 'drafts' | 'history';
@@ -65,6 +72,8 @@ export interface HistoryRecord {
 export class PersonalData {
   private queue = new Map<string, Item>();
   private cache = new Map<string, { item: Item; version: string }>();
+  /** Versions already seen by `changes()`. */
+  private seen = new Map<string, string>();
   private clock = 0;
 
   private constructor(
@@ -116,14 +125,43 @@ export class PersonalData {
     return entry;
   }
 
-  /** Queue a change to some fields. Call `flush()` to write. `undefined` deletes a field. */
-  async set(collection: Collection, key: string, fields: Record<string, unknown>) {
+  /**
+   * Queue a change to some fields. Call `flush()` to write. `undefined` deletes a field
+   * (not for `once` fields). `rules` picks the merge rule per field; the default is last writer wins.
+   */
+  async set(collection: Collection, key: string, fields: Record<string, unknown>, rules: Record<string, MergeRule> = {}) {
     if (!mayBackUp(COLLECTION_TYPE[collection])) throw new KeyholdError('config', `${collection} may not be stored off-device`);
     const id = await this.idFor(collection, key);
     const s = this.stamp();
     const q = this.queue.get(id) ?? { c: collection, k: key, f: {} };
-    for (const [name, v] of Object.entries(fields)) q.f[name] = { v: v === undefined ? null : v, t: s.t, d: s.d };
+    for (const [name, v] of Object.entries(fields)) {
+      const m = rules[name];
+      const f: Field = { v: v === undefined ? null : v, t: s.t, d: s.d, ...(m && m !== 'lww' ? { m } : {}) };
+      q.f[name] = q.f[name] ? pick(q.f[name]!, f) : f;
+    }
     this.queue.set(id, q);
+  }
+
+  /** Changes queued and not yet written. */
+  get pending() {
+    return this.queue.size;
+  }
+
+  /**
+   * Records that changed in storage since the last call (the first call returns everything).
+   * One listing, then a read only for items whose version changed: cheap enough to poll.
+   */
+  async changes(): Promise<{ collection: Collection; key: string; value: Record<string, unknown> }[]> {
+    const out: { collection: Collection; key: string; value: Record<string, unknown> }[] = [];
+    for (const { id, version } of await this.store.list()) {
+      if (id === INDEX_ID || this.seen.get(id) === version) continue;
+      const e = await this.load(id);
+      if (!e) continue;
+      this.seen.set(id, e.version);
+      const v = await this.get(e.item.c as Collection, e.item.k, false);
+      out.push({ collection: e.item.c as Collection, key: e.item.k, value: v ?? {} });
+    }
+    return out;
   }
 
   /** Read one record (including queued, unflushed changes). Fields set to null are absent. */
@@ -223,13 +261,28 @@ export class PersonalData {
   }
 }
 
+/**
+ * Pick the surviving value of one field. A total order for each rule, so the result doesn't
+ * depend on which device writes first (commutative, associative, idempotent: no forks).
+ */
+export function pick(a: Field, b: Field): Field {
+  const rule = a.m === 'once' || b.m === 'once' ? 'once' : a.m === 'max' || b.m === 'max' ? 'max' : 'lww';
+  if (rule === 'once') {
+    if (a.v === null || a.v === undefined) return b.v === null || b.v === undefined ? (later(a, b) ? a : b) : b;
+    if (b.v === null || b.v === undefined) return a;
+    return later(a, b) ? b : a; // the earliest non-empty value stays
+  }
+  if (rule === 'max' && typeof a.v === 'number' && typeof b.v === 'number' && a.v !== b.v) return a.v > b.v ? a : b;
+  return later(b, a) ? b : a;
+}
+
 function merge(a: Item | undefined, b: Item | undefined): Item | undefined {
   if (!a) return b && { ...b, f: { ...b.f } };
   if (!b) return { ...a, f: { ...a.f } };
   const f = { ...a.f };
   for (const [k, v] of Object.entries(b.f)) {
     const cur = f[k];
-    if (!cur || later(v, cur)) f[k] = v;
+    f[k] = cur ? pick(cur, v) : v;
   }
   return { c: a.c, k: a.k, f };
 }
