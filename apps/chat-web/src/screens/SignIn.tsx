@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { CONFIG } from '../config';
 import { mockSignIn, pollDeviceFlow, startDeviceFlow, startWebFlow, type AuthState, type DeviceCode } from '../lib/auth';
-import { ErrorFlash, Icon, useAction } from '../ui';
+import { ErrorFlash, Hint, Icon, useAction } from '../ui';
 
 export function SignIn({ onSignedIn, initialError }: { onSignedIn: (a: AuthState) => void; initialError?: string }) {
   const { busy, error, run, setError } = useAction();
@@ -30,8 +30,8 @@ export function SignIn({ onSignedIn, initialError }: { onSignedIn: (a: AuthState
     <div className="page">
       <div className="narrow">
         <div className="center stack" style={{ alignItems: 'center', gap: 16, marginTop: 24 }}>
-          <span className="logo" style={{ width: 48, height: 48 }}>{Icon.logo()}</span>
-          <h1>Sign in to Keyhold Chat</h1>
+          <span className="logo big">{Icon.logo()}</span>
+          <h1>Keyhold Chat</h1>
         </div>
         <div className="box">
           <div className="box-body stack">
@@ -65,22 +65,16 @@ export function SignIn({ onSignedIn, initialError }: { onSignedIn: (a: AuthState
                   Sign in with GitHub
                 </button>
                 <button className="btn block" disabled={busy} onClick={deviceFlow}>
-                  Sign in with a one-time code instead
+                  Use a one-time code instead
                 </button>
               </>
             )}
           </div>
         </div>
-        <div className="box">
-          <div className="box-body stack small">
-            <p className="row" style={{ gap: 6, fontWeight: 600 }}>{Icon.lock(14)} End-to-end encrypted, GitHub as the only backend</p>
-            <ul className="steps muted">
-              <li>Each chat is a private GitHub repo that only its members can open.</li>
-              <li>Messages are encrypted in this browser (MLS) before they are saved. GitHub sees only ciphertext and who talks to whom.</li>
-              <li>The app only gets access to the repos it creates for you.</li>
-            </ul>
-          </div>
-        </div>
+        <p className="tagline">
+          {Icon.lock(12)} End-to-end encrypted
+          <Hint text="Each chat is a private GitHub repo that only its members can open. Messages are encrypted in this browser (MLS) before they are saved, so GitHub sees only ciphertext and who talks to whom. The app only gets access to the repos it creates for you." />
+        </p>
       </div>
     </div>
   );

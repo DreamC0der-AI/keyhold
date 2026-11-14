@@ -3,7 +3,8 @@ import type { Group } from '@keyhold/chat/index';
 import type { AttachmentRef } from '@keyhold/chat/messages';
 import { describeError, loginFrom, type Convo, type MsgRecord, type PeerInfo, type Session } from '../lib/session';
 import { endedText } from './Home';
-import { Avatar, ErrorFlash, go, Icon, Modal, timeLabel, useAction } from '../ui';
+import { ask, Avatar, ErrorFlash, go, Hint, Icon, timeLabel, toast, useAction } from '../ui';
+import { ChatMenu, CLOSE_ASK, deleteAsk, VerifyModal } from './ChatMenu';
 
 const clock = (ts: number) => new Date(ts).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 const msgTime = (ts: number) => (timeLabel(ts) === clock(ts) ? clock(ts) : `${timeLabel(ts)} ${clock(ts)}`);
@@ -31,7 +32,6 @@ type Item = { kind: 'msg'; m: MsgRecord; group?: Group } | { kind: 'divider'; id
 
 export function Conversation({ session, convo }: { session: Session; convo: Convo }) {
   const [items, setItems] = useState<Item[]>([]);
-  const [panel, setPanel] = useState(false);
   const [verify, setVerify] = useState<string>();
   const [peer, setPeer] = useState<PeerInfo>();
   const v = session.getVersion();
@@ -93,56 +93,54 @@ export function Conversation({ session, convo }: { session: Session; convo: Conv
   return (
     <>
       <div className="convo-head">
-        <div className="who">
-          <a href="#/" className="btn icon mobile-only" aria-label="Back to chats">{Icon.back()}</a>
-          <Avatar name={title} login={peerAddr ? loginFrom(peerAddr) : undefined} square={!dm} size="lg" />
-          <div className="who-text">
+        <a href="#/" className="btn icon ghost mobile-only" aria-label="Back to chats">{Icon.back()}</a>
+        <Avatar name={title} login={peerAddr ? loginFrom(peerAddr) : undefined} square={!dm} size="lg" />
+        <div className="who-text">
+          <span className="convo-title-row">
             <strong className="convo-title">{title}</strong>
-            <div className="convo-sub">
-              {Icon.lock()} End-to-end encrypted
-              {!dm && group && <> · {group.members().length} {group.members().length === 1 ? 'member' : 'members'}</>}
-              {space && <span className="hide-sm"> · <span className="mono">{space.split('/')[1]}</span></span>}
-            </div>
-          </div>
+            <Hint className="hint lock" label="End-to-end encrypted" text={<>End-to-end encrypted. Messages are encrypted in this browser before they're saved to GitHub{space ? <>, in <span className="mono">{space.split('/')[1]}</span></> : ''}.</>}>{Icon.lock(12)}</Hint>
+          </span>
+          {!dm && group && <span className="convo-sub">{group.members().length} {group.members().length === 1 ? 'member' : 'members'}</span>}
         </div>
         <div className="convo-actions">
           {dm && peer && <TrustBadge peer={peer} onClick={() => setVerify(peer.address)} />}
-          <button className="btn" onClick={() => setPanel((p) => !p)} aria-expanded={panel} aria-label={dm ? 'Details' : 'Members'}>
-            {Icon.people()} <span className="hide-sm">{dm ? 'Details' : 'Members'}</span>
-          </button>
+          <ChatMenu session={session} convo={convo} />
         </div>
       </div>
       {peer?.status === 'key-changed' && (
         <div className="flash warn banner">
-          <strong>{loginFrom(peer.address)}'s identity key changed.</strong> They may have a new device or reset their account, or someone may be impersonating them. <button className="btn link" onClick={() => setVerify(peer.address)}>Review</button>
+          <span><strong>{loginFrom(peer.address)}'s identity key changed.</strong> <Hint text="They may have a new device or reset their account, or someone may be impersonating them. Compare safety numbers before you trust it." /></span>
+          <button className="btn" onClick={() => setVerify(peer.address)}>Review</button>
         </div>
       )}
       {peerLeft && (
         <div className="flash warn banner">
-          <strong>{title} left this chat.</strong> You can't send messages here any more.{' '}
-          {session.isOwner(live!) && <button className="btn danger" disabled={busy} onClick={() => confirm(CLOSE_CONFIRM) && run(() => session.closeChat(live!))}>Close chat</button>}
+          <span><strong>{title} left this chat.</strong></span>
+          {session.isOwner(live!) && <button className="btn danger" disabled={busy} onClick={() => run(async () => { if (await ask(CLOSE_ASK)) await session.closeChat(live!); })}>Close chat</button>}
         </div>
       )}
       {!live && (
         <div className="flash banner">
-          <strong>{group ? 'This chat is no longer available.' : `${last.ended ? endedText(session, last.ended, dm) : 'This chat has ended'}.`}</strong>{' '}
-          {group ? "GitHub doesn't let you open it right now. If access comes back, it carries on. " : 'Your copy of the messages stays here until you delete it. '}
-          <span className="row" style={{ marginTop: 6 }}>
+          <span>
+            <strong>{group ? 'This chat is no longer available.' : `${last.ended ? endedText(session, last.ended, dm) : 'This chat has ended'}.`}</strong>{' '}
+            <Hint text={group ? "GitHub doesn't let you open it right now. If access comes back, it carries on." : 'Your copy of the messages stays here until you delete it.'} />
+          </span>
+          <span className="row">
             {dm && peerAddr && !session.blocked.has(peerAddr) && <button className="btn primary" disabled={busy} onClick={startNew}>Start a new chat with {title}</button>}
-            <button className="btn" disabled={busy} onClick={() => confirm(DELETE_CONFIRM(dm ? title : undefined)) && run(async () => { await session.deleteHistory(convo.key); go('/'); })}>Delete chat</button>
+            <button className="btn" disabled={busy} onClick={() => run(async () => { if (await ask(deleteAsk(dm ? title : undefined))) { await session.deleteHistory(convo.key); go('/'); } })}>Delete chat</button>
           </span>
         </div>
       )}
       <ErrorFlash error={error} />
-      <div className="convo-body">
-        <div
-          className="messages"
-          ref={listRef}
-          onScroll={(e) => {
-            const el = e.currentTarget;
-            atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
-          }}
-        >
+      <div
+        className="messages"
+        ref={listRef}
+        onScroll={(e) => {
+          const el = e.currentTarget;
+          atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+        }}
+      >
+        <div className="messages-inner">
           {items.map((it, i) => {
             if (it.kind === 'divider') return <div key={it.id} className="sys divider">{it.text}</div>;
             let prevMsg: Item | undefined;
@@ -160,47 +158,39 @@ export function Conversation({ session, convo }: { session: Session; convo: Conv
           {sending.map((p) => (
             <div key={p.id} className="msg mine">
               <div className="bubble-line"><div className="bubble pending">{p.body}</div></div>
-              <span className="msg-meta"><span className="spinner" style={{ width: 10, height: 10 }} /> Encrypting and sending…</span>
+              <span className="msg-meta"><span className="spinner" style={{ width: 10, height: 10 }} /> Sending…</span>
             </div>
           ))}
           {live && !joined && !peerLeft && pending.length > 0 && (
-            <div className="sys">Waiting for {pending.map((a) => '@' + loginFrom(a)).join(', ')} to accept. You can send messages once someone has joined.</div>
+            <div className="sys">Waiting for {pending.map((a) => '@' + loginFrom(a)).join(', ')} to accept</div>
           )}
         </div>
-        {panel && (
-          <Details session={session} convo={convo} group={group} onClose={() => setPanel(false)} onVerify={setVerify} />
-        )}
       </div>
       {live ? (
         <Composer session={session} group={live} disabledReason={peerLeft ? `${title} left this chat` : !joined ? 'Waiting for the other person to join…' : undefined} error={err} />
       ) : (
-        <div className="composer"><div className="composer-foot"><span>This chat has ended. Nothing can be sent here.</span></div></div>
+        <div className="composer ended">This chat has ended</div>
       )}
       {verify && <VerifyModal session={session} address={verify} onClose={() => setVerify(undefined)} />}
     </>
   );
 }
 
-const CLOSE_CONFIRM = 'Close this chat? It ends for everyone and its repo is deleted from GitHub. Everyone keeps the messages their app has, unless they delete them.';
-const QUIT_CONFIRM = 'Quit this chat? You stop receiving messages. Your copy of the history stays here until you delete it.';
-const DELETE_CONFIRM = (peer?: string) => `Delete this chat's messages from this browser? ${peer ?? 'The other members'} keep${peer ? 's' : ''} their copy.`;
-
 function TrustBadge({ peer, onClick }: { peer: PeerInfo; onClick: () => void }) {
-  if (peer.status === 'none') return <span className="label">No identity yet</span>;
-  if (peer.status === 'error') return null;
-  if (peer.status === 'key-changed') return <button className="label yellow trust" aria-label="Key changed" title="Key changed" onClick={onClick}>{Icon.shield(false)} <span className="hide-sm">Key changed</span></button>;
+  if (peer.status === 'none' || peer.status === 'error') return null;
+  if (peer.status === 'key-changed') return <button className="btn icon ghost trust warn" aria-label="Key changed" title="Key changed. Review the new safety number." onClick={onClick}>{Icon.shield(false, 16)}</button>;
   return peer.verified ? (
-    <button className="label green trust" aria-label="Verified" title="Verified" onClick={onClick}>{Icon.shield(true)} <span className="hide-sm">Verified</span></button>
+    <button className="btn icon ghost trust ok" aria-label="Verified" title="Verified" onClick={onClick}>{Icon.shield(true, 16)}</button>
   ) : (
-    <button className="label yellow trust" aria-label="Unverified · compare" title="Not verified yet. Compare safety numbers." onClick={onClick}>{Icon.shield(false)} <span className="hide-sm">Unverified · compare</span></button>
+    <button className="btn icon ghost trust warn" aria-label="Unverified" title="Not verified yet. Compare safety numbers." onClick={onClick}>{Icon.shield(false, 16)}</button>
   );
 }
 
 function Message({ m, session, group, showAuthor, first = true, last = true }: { m: MsgRecord; session: Session; group?: Group; showAuthor: boolean; first?: boolean; last?: boolean }) {
-  if (m.kind === 'system') return <div className="sys">{m.body}</div>;
+  if (m.kind === 'system') return <div className="sys" title={m.body}>{(m.body ?? '').replace(/\. .*$/, '').replace(/\.$/, '')}</div>;
   const who = loginFrom(m.from);
   const reactions = Object.entries(m.reactions ?? {});
-  const act = (fn: () => Promise<unknown>) => fn().catch((e) => alert(describeError(e)));
+  const act = (fn: () => Promise<unknown>) => fn().catch((e) => toast(describeError(e)));
   const canAct = !m.deleted && !!group?.active;
   return (
     <div className={`msg${m.mine ? ' mine' : ''}${first ? '' : ' cont'}`}>
@@ -215,7 +205,7 @@ function Message({ m, session, group, showAuthor, first = true, last = true }: {
             {EMOJI.map((e) => (
               <button key={e} onClick={() => act(() => session.react(group!, m.id, e))} aria-label={`React ${e}`}>{e}</button>
             ))}
-            {m.mine && <button className="del" onClick={() => confirm('Delete this message for everyone?') && act(() => session.deleteMessage(group!, m.id))}>Delete</button>}
+            {m.mine && <button className="del" aria-label="Delete message" title="Delete for everyone" onClick={() => act(async () => { if (await ask({ title: 'Delete this message for everyone?', confirm: 'Delete', danger: true })) await session.deleteMessage(group!, m.id); })}>{Icon.trash()}</button>}
           </span>
         )}
       </div>
@@ -302,7 +292,7 @@ function Composer({ session, group, disabledReason, error }: { session: Session;
     <div className="composer">
       {(sendError || error) && <ErrorFlash error={sendError ?? `Sync problem: ${error}`} />}
       <div className="composer-row">
-        <button className="btn icon" style={{ border: 0, background: 'none' }} aria-label="Attach file" disabled={!!disabledReason || busy} onClick={() => fileRef.current?.click()}>{Icon.clip()}</button>
+        <button className="btn icon ghost" aria-label="Attach file" title="Attach file" disabled={!!disabledReason || busy} onClick={() => fileRef.current?.click()}>{Icon.clip()}</button>
         <input ref={fileRef} type="file" hidden onChange={(e) => {
           const f = e.target.files?.[0];
           e.target.value = '';
@@ -324,138 +314,8 @@ function Composer({ session, group, disabledReason, error }: { session: Session;
             }
           }}
         />
-        <button className="btn primary" onClick={send} disabled={!!disabledReason || !text.trim()}>Send</button>
-      </div>
-      <div className="composer-foot">
-        <span>Encrypted in this browser before it's saved to GitHub</span>
-        <span className="hide-sm">Enter to send · Shift+Enter for a new line</span>
+        <button className="send" onClick={send} disabled={!!disabledReason || !text.trim()} aria-label="Send" title="Send (Enter). Shift+Enter for a new line.">{Icon.send()}</button>
       </div>
     </div>
-  );
-}
-
-function Details({ session, convo, group, onClose, onVerify }: { session: Session; convo: Convo; group?: Group; onClose: () => void; onVerify: (a: string) => void }) {
-  const dm = convo.dm;
-  const members = group?.members() ?? [];
-  const iAmAdmin = !!group && group.policy.admins.includes(session.identity!.fingerprint);
-  const live = convo.live;
-  const pending = live ? session.pending(live) : [];
-  const [invite, setInvite] = useState('');
-  const [name, setName] = useState(group?.name ?? '');
-  const { busy, error, run } = useAction();
-  const peer = convo.peer;
-  const blocked = !!peer && session.blocked.has(peer);
-  const owner = !!live && session.isOwner(live);
-  return (
-    <aside className="panel" aria-label="Chat details">
-      <div className="panel-head">
-        <h3>{dm ? 'Details' : 'Members'}</h3>
-        <button className="btn icon" onClick={onClose} aria-label="Close panel">{Icon.close()}</button>
-      </div>
-      <ErrorFlash error={error} />
-      {!dm && iAmAdmin && live && (
-        <form className="stack" style={{ gap: 6 }} onSubmit={(e) => { e.preventDefault(); void run(() => session.rename(live, name.trim())); }}>
-          <label className="field">Group name<input className="input" value={name} onChange={(e) => setName(e.target.value)} /></label>
-          <button className="btn" disabled={busy || !name.trim() || name.trim() === live.name}>Rename</button>
-        </form>
-      )}
-      <div>
-        {members.map((m) => {
-          const login = loginFrom(m.address);
-          const me = m.address === session.address;
-          return (
-            <div className="member" key={m.fingerprint}>
-              <Avatar name={login} login={login} size="sm" />
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div className="row" style={{ gap: 4 }}>
-                  <strong>{login}</strong>{me && <span className="muted">(you)</span>}
-                  {m.admin && !dm && <span className="label blue">Admin</span>}
-                </div>
-                <div className="small muted">{m.devices.length} {m.devices.length === 1 ? 'device' : 'devices'}</div>
-              </div>
-              {!me && <button className="btn link small" onClick={() => onVerify(m.address)}>Verify</button>}
-              {!me && !dm && iAmAdmin && live && (
-                <button className="btn danger" disabled={busy} onClick={() => confirm(`Remove ${login} from the group? Keys rotate right away.`) && run(() => session.removeMember(live, m.fingerprint))}>Remove</button>
-              )}
-            </div>
-          );
-        })}
-        {pending.map((a) => (
-          <div className="member" key={a}>
-            <Avatar name={loginFrom(a)} login={loginFrom(a)} size="sm" />
-            <div style={{ flex: 1 }}><strong>{loginFrom(a)}</strong><div className="small muted">Invited, not joined yet</div></div>
-          </div>
-        ))}
-      </div>
-      {!dm && iAmAdmin && live && (
-        <form className="stack" style={{ gap: 6 }} onSubmit={(e) => { e.preventDefault(); void run(async () => { await session.invite(live, invite); setInvite(''); }); }}>
-          <label className="field">Invite someone<input className="input" value={invite} onChange={(e) => setInvite(e.target.value)} placeholder="GitHub username" autoComplete="off" /></label>
-          <button className="btn primary" disabled={busy || !invite.trim()}>{busy ? <span className="spinner" /> : 'Invite'}</button>
-        </form>
-      )}
-      {group && (
-        <div className="stack small muted" style={{ gap: 6 }}>
-          <span>Stored in <a href={`https://github.com/${group.space}`} target="_blank" rel="noreferrer" className="mono">{group.space}</a>. The files there are ciphertext.</span>
-          <span>Key epoch {String(group.epoch)}. Keys rotate every 7 days or 100 messages, and whenever someone leaves.</span>
-        </div>
-      )}
-      <div className="stack" style={{ gap: 6 }}>
-        {live && owner && (
-          <>
-            <button className="btn danger" disabled={busy} onClick={() => confirm(CLOSE_CONFIRM) && run(() => session.closeChat(live))}>Close chat</button>
-            <span className="small muted">Ends it for everyone and deletes its repo. You started it, so only you can close it.</span>
-          </>
-        )}
-        {live && !owner && (
-          <>
-            <button className="btn danger" disabled={busy} onClick={() => confirm(QUIT_CONFIRM) && run(() => session.quitChat(live))}>Quit chat</button>
-            <span className="small muted">You leave; {dm ? `${convo.title} keeps` : 'the others keep'} the chat.</span>
-          </>
-        )}
-        <button className="btn" disabled={busy} onClick={() => confirm(DELETE_CONFIRM(dm ? convo.title : undefined)) && run(async () => { await session.deleteHistory(convo.key); if (!live) go('/'); })}>Delete chat</button>
-        <span className="small muted">Deletes the messages in this browser only.{live ? ' The chat stays open.' : ''}</span>
-        {dm && peer && (blocked ? (
-          <button className="btn" disabled={busy} onClick={() => run(() => session.unblock(peer))}>Unblock {convo.title}</button>
-        ) : (
-          <button className="btn danger" disabled={busy} onClick={() => confirm(`Block ${convo.title}? ${live ? (owner ? 'This chat is closed, and ' : 'You quit this chat, and ') : ''}their invitations are turned down without asking you.`) && run(() => session.block(peer))}>Block {convo.title}</button>
-        ))}
-      </div>
-    </aside>
-  );
-}
-
-function VerifyModal({ session, address, onClose }: { session: Session; address: string; onClose: () => void }) {
-  const [p, setP] = useState<PeerInfo>();
-  const { busy, error, run } = useAction();
-  const login = loginFrom(address);
-  const v = session.getVersion();
-  useEffect(() => {
-    void session.peer(address, true).then(setP);
-  }, [address, v]);
-  return (
-    <Modal title={`Verify ${login}`} onClose={onClose}>
-      {!p ? <span className="spinner" /> : p.status === 'none' ? (
-        <p>{login} hasn't created an identity yet.</p>
-      ) : p.status === 'error' ? (
-        <ErrorFlash error={p.error} />
-      ) : (
-        <>
-          {p.status === 'key-changed' && (
-            <div className="flash warn">{login}'s identity key is different from the one you saw before. Compare the new safety number with them in person or on a call before you accept it.</div>
-          )}
-          <p>Compare these numbers with {login} in person or on a call. If they match on both screens, nobody is in the middle.</p>
-          <div className="safety">{p.safety?.split(' ').map((g, i) => <span key={i}>{g}</span>)}</div>
-          <p className="small muted">Their key fingerprint: <span className="mono">{p.fingerprint?.slice(0, 32)}…</span></p>
-          <ErrorFlash error={error} />
-          {p.status === 'key-changed' ? (
-            <button className="btn primary block" disabled={busy} onClick={() => run(() => session.acceptKeyChange(address))}>Numbers match, accept the new key</button>
-          ) : p.verified ? (
-            <div className="flash">{Icon.shield(true)} You marked {login} as verified.</div>
-          ) : (
-            <button className="btn primary block" disabled={busy} onClick={() => run(() => session.markVerified(address))}>Numbers match, mark as verified</button>
-          )}
-        </>
-      )}
-    </Modal>
   );
 }
