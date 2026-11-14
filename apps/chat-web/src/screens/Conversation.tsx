@@ -107,7 +107,7 @@ export function Conversation({ session, convo }: { session: Session; convo: Conv
         </div>
         <div className="convo-actions">
           {dm && peer && <TrustBadge peer={peer} onClick={() => setVerify(peer.address)} />}
-          <button className="btn" onClick={() => setPanel((p) => !p)} aria-expanded={panel}>
+          <button className="btn" onClick={() => setPanel((p) => !p)} aria-expanded={panel} aria-label={dm ? 'Details' : 'Members'}>
             {Icon.people()} <span className="hide-sm">{dm ? 'Details' : 'Members'}</span>
           </button>
         </div>
