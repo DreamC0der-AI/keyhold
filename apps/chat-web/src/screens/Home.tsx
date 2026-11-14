@@ -92,7 +92,7 @@ function ChatRow({ session, c, active }: { session: Session; c: Convo; active: b
       : waiting ? `Waiting for ${c.title} to join` : 'No messages yet');
   return (
     <li>
-      <button className={`chat-item${active ? ' active' : ''}`} onClick={() => go(`/c/${encodeURIComponent(c.key)}`)}>
+      <button className={`chat-item${active ? ' active' : ''}${c.unread ? ' unread' : ''}`} onClick={() => go(`/c/${encodeURIComponent(c.key)}`)}>
         <Avatar name={c.title} login={c.peer ? loginFrom(c.peer) : undefined} square={!c.dm} />
         <span className="meta">
           <span className="name">
@@ -129,8 +129,8 @@ function Invites({ session }: { session: Session }) {
   const list = session.pendingInvites();
   if (!list.length) return null;
   return (
-    <li style={{ borderBottom: '1px solid var(--border)', background: 'var(--accent-bg)' }}>
-      <div className="small" style={{ padding: '8px 16px 0', fontWeight: 600 }}>Invitations</div>
+    <li className="invites">
+      <div className="invites-head">Invitations <span className="counter">{list.length}</span></div>
       {list.map((inv) => <InviteRow key={inv.key} session={session} inv={inv} />)}
     </li>
   );
@@ -145,7 +145,7 @@ function InviteRow({ session, inv }: { session: Session; inv: PendingInvite }) {
     : inv.status === 'waiting' ? `Waiting for @${from}'s app to confirm your identity. This happens as soon as they have Keyhold Chat open.`
     : 'Could not join yet.';
   return (
-    <div className="row" style={{ padding: '8px 16px', alignItems: 'flex-start', flexWrap: 'nowrap' }}>
+    <div className="row invite-row">
       <Avatar name={from} login={from} />
       <div style={{ flex: 1, minWidth: 0 }}>
         <div><strong>{from}</strong> invited you to a chat</div>

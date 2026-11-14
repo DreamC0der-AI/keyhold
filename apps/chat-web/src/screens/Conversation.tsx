@@ -1,13 +1,31 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { Fragment, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { Group } from '@keyhold/chat/index';
 import type { AttachmentRef } from '@keyhold/chat/messages';
 import { describeError, loginFrom, type Convo, type MsgRecord, type PeerInfo, type Session } from '../lib/session';
 import { endedText } from './Home';
 import { Avatar, ErrorFlash, go, Icon, Modal, timeLabel, useAction } from '../ui';
 
-const clock = (ts: number) => new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+const clock = (ts: number) => new Date(ts).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 const msgTime = (ts: number) => (timeLabel(ts) === clock(ts) ? clock(ts) : `${timeLabel(ts)} ${clock(ts)}`);
 const EMOJI = ['👍', '❤️', '😂', '🎉', '👀'];
+const RUN_GAP = 5 * 60_000;
+const dayKey = (ts: number) => new Date(ts).toDateString();
+function dayLabel(ts: number) {
+  const now = new Date();
+  const y = new Date(now);
+  y.setDate(now.getDate() - 1);
+  const k = dayKey(ts);
+  if (k === now.toDateString()) return 'Today';
+  if (k === y.toDateString()) return 'Yesterday';
+  const d = new Date(ts);
+  return d.toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric', ...(d.getFullYear() === now.getFullYear() ? {} : { year: 'numeric' }) });
+}
+/** Two messages read as one run: same sender, a few minutes apart, same day. */
+function sameRun(a: Item | undefined, b: Item | undefined) {
+  if (a?.kind !== 'msg' || b?.kind !== 'msg') return false;
+  if (a.m.kind === 'system' || b.m.kind === 'system') return false;
+  return a.m.from === b.m.from && a.m.mine === b.m.mine && Math.abs(b.m.ts - a.m.ts) < RUN_GAP && dayKey(a.m.ts) === dayKey(b.m.ts);
+}
 
 type Item = { kind: 'msg'; m: MsgRecord; group?: Group } | { kind: 'divider'; id: string; text: string };
 
@@ -78,16 +96,16 @@ export function Conversation({ session, convo }: { session: Session; convo: Conv
         <div className="who">
           <a href="#/" className="btn icon mobile-only" aria-label="Back to chats">{Icon.back()}</a>
           <Avatar name={title} login={peerAddr ? loginFrom(peerAddr) : undefined} square={!dm} size="lg" />
-          <div style={{ minWidth: 0 }}>
-            <strong style={{ fontSize: 16 }}>{title}</strong>
-            <div className="small muted row" style={{ gap: 4 }}>
+          <div className="who-text">
+            <strong className="convo-title">{title}</strong>
+            <div className="convo-sub">
               {Icon.lock()} End-to-end encrypted
               {!dm && group && <> · {group.members().length} {group.members().length === 1 ? 'member' : 'members'}</>}
               {space && <span className="hide-sm"> · <span className="mono">{space.split('/')[1]}</span></span>}
             </div>
           </div>
         </div>
-        <div className="row">
+        <div className="convo-actions">
           {dm && peer && <TrustBadge peer={peer} onClick={() => setVerify(peer.address)} />}
           <button className="btn" onClick={() => setPanel((p) => !p)} aria-expanded={panel}>
             {Icon.people()} <span className="hide-sm">{dm ? 'Details' : 'Members'}</span>
@@ -95,18 +113,18 @@ export function Conversation({ session, convo }: { session: Session; convo: Conv
         </div>
       </div>
       {peer?.status === 'key-changed' && (
-        <div className="flash warn" style={{ margin: '8px 16px 0', borderRadius: 6 }}>
+        <div className="flash warn banner">
           <strong>{loginFrom(peer.address)}'s identity key changed.</strong> They may have a new device or reset their account, or someone may be impersonating them. <button className="btn link" onClick={() => setVerify(peer.address)}>Review</button>
         </div>
       )}
       {peerLeft && (
-        <div className="flash warn banner" style={{ margin: '8px 16px 0', borderRadius: 6 }}>
+        <div className="flash warn banner">
           <strong>{title} left this chat.</strong> You can't send messages here any more.{' '}
           {session.isOwner(live!) && <button className="btn danger" disabled={busy} onClick={() => confirm(CLOSE_CONFIRM) && run(() => session.closeChat(live!))}>Close chat</button>}
         </div>
       )}
       {!live && (
-        <div className="flash banner" style={{ margin: '8px 16px 0', borderRadius: 6 }}>
+        <div className="flash banner">
           <strong>{group ? 'This chat is no longer available.' : `${last.ended ? endedText(session, last.ended, dm) : 'This chat has ended'}.`}</strong>{' '}
           {group ? "GitHub doesn't let you open it right now. If access comes back, it carries on. " : 'Your copy of the messages stays here until you delete it. '}
           <span className="row" style={{ marginTop: 6 }}>
@@ -125,15 +143,24 @@ export function Conversation({ session, convo }: { session: Session; convo: Conv
             atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
           }}
         >
-          {items.map((it) => it.kind === 'divider'
-            ? <div key={it.id} className="sys divider">{it.text}</div>
-            : <Message key={`${it.m.groupId}/${it.m.id}`} m={it.m} session={session} group={it.group} showAuthor={!dm} />)}
+          {items.map((it, i) => {
+            if (it.kind === 'divider') return <div key={it.id} className="sys divider">{it.text}</div>;
+            let prevMsg: Item | undefined;
+            for (let j = i - 1; j >= 0 && !prevMsg; j--) if (items[j]!.kind === 'msg') prevMsg = items[j];
+            const newDay = prevMsg?.kind !== 'msg' || dayKey(prevMsg.m.ts) !== dayKey(it.m.ts);
+            const first = !sameRun(items[i - 1], it);
+            const last = !sameRun(it, items[i + 1]);
+            return (
+              <Fragment key={`${it.m.groupId}/${it.m.id}`}>
+                {newDay && <div className="day-divider" role="separator"><span>{dayLabel(it.m.ts)}</span></div>}
+                <Message m={it.m} session={session} group={it.group} showAuthor={!dm} first={first} last={last} />
+              </Fragment>
+            );
+          })}
           {sending.map((p) => (
             <div key={p.id} className="msg mine">
-              <div className="col">
-                <div className="bubble pending">{p.body}</div>
-                <span className="msg-meta"><span className="spinner" style={{ width: 10, height: 10 }} /> Encrypting and sending…</span>
-              </div>
+              <div className="bubble-line"><div className="bubble pending">{p.body}</div></div>
+              <span className="msg-meta"><span className="spinner" style={{ width: 10, height: 10 }} /> Encrypting and sending…</span>
             </div>
           ))}
           {live && !joined && !peerLeft && pending.length > 0 && (
@@ -161,49 +188,52 @@ const DELETE_CONFIRM = (peer?: string) => `Delete this chat's messages from this
 function TrustBadge({ peer, onClick }: { peer: PeerInfo; onClick: () => void }) {
   if (peer.status === 'none') return <span className="label">No identity yet</span>;
   if (peer.status === 'error') return null;
-  if (peer.status === 'key-changed') return <button className="label yellow" style={{ cursor: 'pointer', background: 'none' }} onClick={onClick}>{Icon.shield(false)} Key changed</button>;
+  if (peer.status === 'key-changed') return <button className="label yellow trust" aria-label="Key changed" title="Key changed" onClick={onClick}>{Icon.shield(false)} <span className="hide-sm">Key changed</span></button>;
   return peer.verified ? (
-    <button className="label green" style={{ cursor: 'pointer', background: 'none' }} onClick={onClick}>{Icon.shield(true)} Verified</button>
+    <button className="label green trust" aria-label="Verified" title="Verified" onClick={onClick}>{Icon.shield(true)} <span className="hide-sm">Verified</span></button>
   ) : (
-    <button className="label yellow" style={{ cursor: 'pointer', background: 'none' }} onClick={onClick}>{Icon.shield(false)} Unverified · compare</button>
+    <button className="label yellow trust" aria-label="Unverified · compare" title="Not verified yet. Compare safety numbers." onClick={onClick}>{Icon.shield(false)} <span className="hide-sm">Unverified · compare</span></button>
   );
 }
 
-function Message({ m, session, group, showAuthor }: { m: MsgRecord; session: Session; group?: Group; showAuthor: boolean }) {
+function Message({ m, session, group, showAuthor, first = true, last = true }: { m: MsgRecord; session: Session; group?: Group; showAuthor: boolean; first?: boolean; last?: boolean }) {
   if (m.kind === 'system') return <div className="sys">{m.body}</div>;
   const who = loginFrom(m.from);
   const reactions = Object.entries(m.reactions ?? {});
   const act = (fn: () => Promise<unknown>) => fn().catch((e) => alert(describeError(e)));
+  const canAct = !m.deleted && !!group?.active;
   return (
-    <div className={`msg${m.mine ? ' mine' : ''}`}>
-      {!m.mine && <Avatar name={who} login={who} size="sm" />}
-      <div className="col">
-        {showAuthor && !m.mine && <span className="small muted">{who}</span>}
-        <div className={`bubble${m.deleted ? ' deleted' : ''}`}>
+    <div className={`msg${m.mine ? ' mine' : ''}${first ? '' : ' cont'}`}>
+      {!m.mine && last && <span className="msg-avatar"><Avatar name={who} login={who} size="sm" /></span>}
+      {showAuthor && !m.mine && first && <span className="msg-author">{who}</span>}
+      <div className="bubble-line">
+        <div className={`bubble${m.deleted ? ' deleted' : ''}`} title={new Date(m.ts).toLocaleString()}>
           {m.deleted ? 'Message deleted' : m.kind === 'attachment' && m.file ? (group ? <FileView session={session} group={group} file={m.file} caption={m.caption} /> : <span className="muted">📎 {m.file.name ?? 'file'} (no longer available)</span>) : m.body}
         </div>
-        {reactions.length > 0 && (
-          <div className="reactions">
-            {reactions.map(([e, who]) => (
-              <button key={e} className={`reaction${who.includes(session.address) ? ' me' : ''}`} title={who.map(loginFrom).join(', ')} disabled={!group?.active} onClick={() => group && act(() => session.react(group, m.id, e))}>
-                {e} {who.length}
-              </button>
+        {canAct && (
+          <span className="msg-actions" role="toolbar" aria-label="Message actions">
+            {EMOJI.map((e) => (
+              <button key={e} onClick={() => act(() => session.react(group!, m.id, e))} aria-label={`React ${e}`}>{e}</button>
             ))}
-          </div>
+            {m.mine && <button className="del" onClick={() => confirm('Delete this message for everyone?') && act(() => session.deleteMessage(group!, m.id))}>Delete</button>}
+          </span>
         )}
-        <span className="msg-meta">
-          {msgTime(m.ts)}
-          {m.edited && ' · edited'}
-          {!m.deleted && group?.active && (
-            <span className="msg-actions">
-              {EMOJI.map((e) => (
-                <button key={e} onClick={() => act(() => session.react(group, m.id, e))} aria-label={`React ${e}`}>{e}</button>
-              ))}
-              {m.mine && <button onClick={() => confirm('Delete this message for everyone?') && act(() => session.deleteMessage(group, m.id))}>Delete</button>}
-            </span>
-          )}
-        </span>
       </div>
+      {reactions.length > 0 && (
+        <div className="reactions">
+          {reactions.map(([e, who]) => (
+            <button key={e} className={`reaction${who.includes(session.address) ? ' me' : ''}`} title={who.map(loginFrom).join(', ')} disabled={!group?.active} onClick={() => group && act(() => session.react(group, m.id, e))}>
+              {e} <span>{who.length}</span>
+            </button>
+          ))}
+        </div>
+      )}
+      {(last || m.edited) && (
+        <span className="msg-meta">
+          {last && msgTime(m.ts)}
+          {m.edited && (last ? ' · edited' : 'Edited')}
+        </span>
+      )}
     </div>
   );
 }
@@ -318,7 +348,7 @@ function Details({ session, convo, group, onClose, onVerify }: { session: Sessio
   const owner = !!live && session.isOwner(live);
   return (
     <aside className="panel" aria-label="Chat details">
-      <div className="row" style={{ justifyContent: 'space-between' }}>
+      <div className="panel-head">
         <h3>{dm ? 'Details' : 'Members'}</h3>
         <button className="btn icon" onClick={onClose} aria-label="Close panel">{Icon.close()}</button>
       </div>
