@@ -8,7 +8,7 @@ function Frame({ title, children }: { title: string; children: React.ReactNode }
     <div className="page">
       <div className="narrow">
         <div className="center stack" style={{ alignItems: 'center', marginTop: 16 }}>
-          <span className="logo" style={{ width: 40, height: 40 }}>{Icon.logo()}</span>
+          <span className="logo xl">{Icon.logo()}</span>
           <h2>{title}</h2>
         </div>
         {children}

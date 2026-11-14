@@ -843,7 +843,7 @@ export class Session {
     await this.saveRecord(r);
     this.bump();
     await g.invite(address);
-    await this.systemNote(g.id, `Invitation sent to @${login}. The chat opens for them when they accept in this app.`);
+    await this.systemNote(g.id, `Invitation sent to @${login}`);
     this.bump();
     return this.convoKey(r);
   }

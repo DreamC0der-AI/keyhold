@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { loginFrom, type Convo, type PendingInvite, type Session } from '../lib/session';
-import { Avatar, ErrorFlash, go, Icon, Modal, timeLabel, useAction, useSession } from '../ui';
+import { Avatar, ErrorFlash, go, Icon, Modal, timeLabel, Tip, useAction, useSession } from '../ui';
 import { Conversation } from './Conversation';
 
 export function Home({ session, route }: { session: Session; route: string }) {
@@ -27,55 +27,50 @@ export function Home({ session, route }: { session: Session; route: string }) {
   );
 
   return (
-    <div className="app">
-      <header className="header">
-        <a href="#/" className="logo" aria-label="Chats home">{Icon.logo()}</a>
-        <nav className="crumbs" aria-label="Breadcrumb">
-          <span className="hide-sm">{session.login}</span>
-          <span className="muted hide-sm">/</span>
-          {convo ? <><a href="#/">Chats</a><span className="muted">/</span><strong>{convo.title}</strong></> : <strong>Chats</strong>}
-        </nav>
-        <span className="spacer" />
-        <button className="btn icon" aria-label="New chat" title="New chat" onClick={() => setModal('dm')}>{Icon.plus()}</button>
-        <a href="#/settings" aria-label="Account and devices" title="Account and devices"><Avatar name={session.login} login={session.login} /></a>
-      </header>
-      <div className={`main${convo ? ' has-chat' : ''}`}>
-        <nav className="sidebar" aria-label="Chats">
-          <div className="sidebar-head">
-            <label className="sr" htmlFor="q">Search chats</label>
-            <input id="q" className="input" type="search" placeholder="Search chats" value={q} onChange={(e) => setQ(e.target.value)} />
-            <div className="row" style={{ flexWrap: 'nowrap' }}>
-              <button className="btn primary" onClick={() => setModal('dm')}>New</button>
-              <button className="btn icon" aria-label="New group" title="New group" onClick={() => setModal('group')}>{Icon.people()}</button>
-            </div>
+    <div className={`app main${convo || chatId ? ' has-chat' : ''}`}>
+      <nav className="sidebar" aria-label="Chats">
+        <div className="sidebar-head">
+          <div className="sidebar-top">
+            <a href="#/" className="logo" aria-label="Chats home">{Icon.logo()}</a>
+            <h1 className="sidebar-title">Chats</h1>
+            <SyncDot session={session} />
+            <span className="spacer" />
+            <button className="btn icon ghost" aria-label="New group" title="New group" onClick={() => setModal('group')}>{Icon.people()}</button>
+            <button className="btn icon ghost" aria-label="New chat" title="New chat" onClick={() => setModal('dm')}>{Icon.compose()}</button>
+            <a href="#/settings" className="me" aria-label="Account and devices" title="Account and devices"><Avatar name={session.login} login={session.login} size="sm" /></a>
           </div>
-          <ul className="chat-list">
-            <Invites session={session} />
-            {shown.map((c) => <ChatRow key={c.key} session={session} c={c} active={c.key === convo?.key} />)}
-            {!convos.length && !session.pendingInvites().length && (
-              <li className="empty" style={{ padding: 32 }}>
-                <p>No chats yet.</p>
-                <button className="btn primary" onClick={() => setModal('dm')}>Start a chat</button>
-                <p className="small">When someone invites you, the invitation shows up right here for you to accept.</p>
-              </li>
-            )}
-          </ul>
-          <StatusBar session={session} />
-        </nav>
-        <main className="content">
-          {convo ? (
-            <Conversation key={convo.key} session={session} convo={convo} />
-          ) : chatId ? (
-            <div className="empty"><p>This chat isn't on this browser.</p><a href="#/">Back to chats</a></div>
-          ) : (
-            <div className="empty">
-              {Icon.lock(28)}
-              <h3 style={{ color: 'var(--fg)' }}>Pick a chat or start a new one</h3>
-              <p>Messages are encrypted in this browser before they're saved to GitHub.</p>
-            </div>
+          <div className="search">
+            {Icon.search()}
+            <label className="sr" htmlFor="q">Search chats</label>
+            <input id="q" type="search" placeholder="Search" value={q} onChange={(e) => setQ(e.target.value)} />
+          </div>
+        </div>
+        <ul className="chat-list">
+          <SyncNotice session={session} />
+          <Invites session={session} />
+          {shown.map((c) => <ChatRow key={c.key} session={session} c={c} active={c.key === convo?.key} />)}
+          {!convos.length && !session.pendingInvites().length && (
+            <li className="empty list-empty">
+              <p>No chats yet</p>
+              <button className="btn primary" onClick={() => setModal('dm')}>Start a chat</button>
+            </li>
           )}
-        </main>
-      </div>
+          {!!convos.length && !shown.length && <li className="empty list-empty"><p>No chats match “{q}”</p></li>}
+        </ul>
+      </nav>
+      <main className="content">
+        {convo ? (
+          <Conversation key={convo.key} session={session} convo={convo} />
+        ) : chatId ? (
+          <div className="empty"><p>This chat isn't on this browser.</p><a href="#/">Back to chats</a></div>
+        ) : (
+          <div className="empty">
+            <span className="empty-icon">{Icon.lock(28)}</span>
+            <h3>Pick a chat or start a new one</h3>
+            <button className="btn primary" onClick={() => setModal('dm')}>New chat</button>
+          </div>
+        )}
+      </main>
       {modal === 'dm' && <NewDm session={session} onClose={() => setModal(undefined)} onGroup={() => setModal('group')} />}
       {modal === 'group' && <NewGroup session={session} onClose={() => setModal(undefined)} />}
     </div>
@@ -83,30 +78,20 @@ export function Home({ session, route }: { session: Session; route: string }) {
 }
 
 function ChatRow({ session, c, active }: { session: Session; c: Convo; active: boolean }) {
-  const g = c.live ?? c.current;
   const last = c.rooms[c.rooms.length - 1]!;
   const pending = c.live ? session.pending(c.live) : [];
   const waiting = c.dm && pending.length > 0;
   const preview = c.lastText
-    ?? (!c.live ? (last.ended ? endedText(session, last.ended, c.dm) : 'This chat is no longer available')
-      : waiting ? `Waiting for ${c.title} to join` : 'No messages yet');
+    ?? (!c.live ? (last.ended ? endedText(session, last.ended, c.dm) : 'No longer available')
+      : waiting ? 'Invitation sent' : 'No messages yet');
   return (
     <li>
-      <button className={`chat-item${active ? ' active' : ''}${c.unread ? ' unread' : ''}`} onClick={() => go(`/c/${encodeURIComponent(c.key)}`)}>
-        <Avatar name={c.title} login={c.peer ? loginFrom(c.peer) : undefined} square={!c.dm} />
-        <span className="meta">
-          <span className="name">
-            <span>{c.title}</span>
-            {!c.dm && g && <span className="label">{g.members().length}</span>}
-            {waiting && <span className="label">Invite sent</span>}
-            {!c.live && <span className="label">Ended</span>}
-          </span>
-          <span className="preview">{preview}</span>
-        </span>
-        <span className="right">
-          <span>{timeLabel(c.lastTs)}</span>
-          {!!c.unread && <span className="counter">{c.unread}</span>}
-        </span>
+      <button className={`chat-item${active ? ' active' : ''}${c.unread ? ' unread' : ''}${!c.live ? ' ended' : ''}`} onClick={() => go(`/c/${encodeURIComponent(c.key)}`)}>
+        <Avatar name={c.title} login={c.peer ? loginFrom(c.peer) : undefined} square={!c.dm} size="lg" />
+        <span className="name"><span>{c.title}</span></span>
+        <span className="time">{timeLabel(c.lastTs)}</span>
+        <span className="preview">{preview}</span>
+        {!!c.unread && <span className="counter" aria-label={`${c.unread} unread`}>{c.unread}</span>}
       </button>
     </li>
   );
@@ -130,7 +115,7 @@ function Invites({ session }: { session: Session }) {
   if (!list.length) return null;
   return (
     <li className="invites">
-      <div className="invites-head">Invitations <span className="counter">{list.length}</span></div>
+      <div className="section-label">Invitations</div>
       {list.map((inv) => <InviteRow key={inv.key} session={session} inv={inv} />)}
     </li>
   );
@@ -139,30 +124,29 @@ function Invites({ session }: { session: Session }) {
 function InviteRow({ session, inv }: { session: Session; inv: PendingInvite }) {
   const { busy, error, run } = useAction();
   const from = loginFrom(inv.from);
-  const text =
-    inv.status === 'invited' ? 'Accept to open the chat. Decline to turn it down on GitHub too.'
-    : inv.status === 'joining' ? (inv.space ? 'Joining…' : 'Accepted. Opening the chat…')
-    : inv.status === 'waiting' ? `Waiting for @${from}'s app to confirm your identity. This happens as soon as they have Keyhold Chat open.`
-    : 'Could not join yet.';
   return (
     <div className="row invite-row">
-      <Avatar name={from} login={from} />
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div><strong>{from}</strong> invited you to a chat</div>
-        <div className="small muted" title={inv.error}>
-          {inv.status === 'joining' || inv.status === 'waiting' ? <span className="spinner" style={{ width: 10, height: 10, marginRight: 4 }} /> : null}
-          {text}{inv.error ? ` ${inv.error}` : ''}
-        </div>
+      <Avatar name={from} login={from} size="lg" />
+      <div className="invite-text">
+        <div><strong>{from}</strong> invited you</div>
+        {inv.status !== 'invited' && (
+          <div className="small muted row" style={{ gap: 4, flexWrap: 'nowrap' }}>
+            {(inv.status === 'joining' || inv.status === 'waiting') && <span className="spinner sm" />}
+            {inv.status === 'joining' ? 'Joining…' : inv.status === 'waiting' ? `Waiting for @${from}` : 'Couldn’t join yet'}
+            {inv.status === 'waiting' && <Tip align="start">@{from}'s app confirms your identity the next time they have Keyhold Chat open.</Tip>}
+            {inv.status === 'error' && inv.error && <Tip align="start">{inv.error}</Tip>}
+          </div>
+        )}
         <ErrorFlash error={error} />
         {inv.status === 'invited' && (
-          <div className="row" style={{ marginTop: 6 }}>
-            <button className="btn primary" disabled={busy} onClick={() => run(() => session.acceptInvite(inv.key))}>Accept</button>
-            <button className="btn" disabled={busy} onClick={() => run(() => session.declineInvite(inv.key))}>Decline</button>
+          <div className="row" style={{ marginTop: 8 }}>
+            <button className="btn primary sm" disabled={busy} onClick={() => run(() => session.acceptInvite(inv.key))}>Accept</button>
+            <button className="btn sm" disabled={busy} onClick={() => run(() => session.declineInvite(inv.key))}>Decline</button>
           </div>
         )}
         {(inv.status === 'waiting' || inv.status === 'error') && (
-          <div className="row" style={{ marginTop: 4 }}>
-            <button className="btn" onClick={() => session.retryInvite(inv.key)}>Try again</button>
+          <div className="row" style={{ marginTop: 6 }}>
+            <button className="btn sm" onClick={() => session.retryInvite(inv.key)}>Try again</button>
             <button className="btn link small" onClick={() => session.dismissInvite(inv.key)}>Dismiss</button>
           </div>
         )}
@@ -171,17 +155,20 @@ function InviteRow({ session, inv }: { session: Session; inv: PendingInvite }) {
   );
 }
 
-function StatusBar({ session }: { session: Session }) {
+/** A small dot beside the title: green when sync is fine. Details live in its tooltip. */
+function SyncDot({ session }: { session: Session }) {
   const err = session.lastPollError;
+  const text = `${err ? `Sync problem: ${err}` : 'Up to date'}${session.rateRemaining !== undefined ? ` · ${session.rateRemaining.toLocaleString()} GitHub requests left this hour` : ''}`;
+  return <span className={`dot${err ? ' warn' : ''}`} title={text} role="status" aria-label={text} />;
+}
+
+function SyncNotice({ session }: { session: Session }) {
+  const err = session.lastPollError;
+  if (!err && session.syncOn) return null;
   return (
-    <div className="status-bar" title={err}>
-      <span className={`dot${err ? ' warn' : ''}`} />
-      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-        {err ? `Sync problem: ${err}` : 'Up to date'}
-        {session.rateRemaining !== undefined && ` · ${session.rateRemaining.toLocaleString()} GitHub requests left this hour`}
-      </span>
-      {!session.syncOn && <a href="#/settings" className="small" style={{ whiteSpace: 'nowrap' }}>Turn on sync</a>}
-    </div>
+    <li className="notice">
+      {err ? <><span className="dot warn" /> Can't reach GitHub right now <Tip align="start">{err}</Tip></> : <><span className="dot off" /> Sync across browsers is off <a href="#/settings">Turn on</a></>}
+    </li>
   );
 }
 
@@ -202,14 +189,16 @@ function NewDm({ session, onClose, onGroup }: { session: Session; onClose: () =>
           });
         }}
       >
-        <label className="field">
-          GitHub username
-          <input className="input" value={login} onChange={(e) => setLogin(e.target.value)} placeholder="octocat" autoFocus autoComplete="off" />
-          <span className="hint">They get a GitHub repo invitation. The chat opens for them when they sign in here. Not on Keyhold Chat yet? Send them this page's address.</span>
-        </label>
+        <div className="field">
+          <div className="field-label">
+            <label htmlFor="new-dm-login">GitHub username</label>
+            <Tip align="start">They get a GitHub invitation to a new private repo (like <code>ghchat-3f9a…</code>) on your account. The chat opens for them when they sign in here. Not on Keyhold Chat yet? Send them this page's address.</Tip>
+          </div>
+          <input id="new-dm-login" className="input" value={login} onChange={(e) => setLogin(e.target.value)} placeholder="octocat" autoFocus autoComplete="off" />
+        </div>
         {theirs && (
           <div className="flash">
-            <strong>{loginFrom(theirs.from)}</strong> already invited you. Accept their invitation instead of starting a second chat.{' '}
+            <strong>{loginFrom(theirs.from)}</strong> already invited you.{' '}
             <button type="button" className="btn primary" disabled={busy} onClick={() => run(async () => { await session.acceptInvite(theirs.key); onClose(); })}>Accept their invitation</button>
           </div>
         )}
@@ -218,7 +207,6 @@ function NewDm({ session, onClose, onGroup }: { session: Session; onClose: () =>
           <button type="button" className="btn link" onClick={onGroup}>New group instead</button>
           <button className="btn primary" disabled={busy || !login.trim()}>{busy ? <><span className="spinner" /> Creating…</> : 'Start chat'}</button>
         </div>
-        <p className="muted small">This creates a private repo with a random name (like <code>ghchat-3f9a…</code>) on your account.</p>
       </form>
     </Modal>
   );
@@ -242,16 +230,17 @@ function NewGroup({ session, onClose }: { session: Session; onClose: () => void 
           });
         }}
       >
-        <label className="field">
-          Group name
-          <input className="input" value={name} onChange={(e) => setName(e.target.value)} placeholder="Weekend hikers" autoFocus />
-          <span className="hint">Encrypted. Only members see it, not GitHub.</span>
-        </label>
-        <label className="field">
-          Invite people
-          <input className="input" value={people} onChange={(e) => setPeople(e.target.value)} placeholder="alice, bob" autoComplete="off" />
-          <span className="hint">GitHub usernames, separated by commas. You can add more later.</span>
-        </label>
+        <div className="field">
+          <div className="field-label">
+            <label htmlFor="new-group-name">Group name</label>
+            <Tip align="start">Encrypted. Only members see it, not GitHub.</Tip>
+          </div>
+          <input id="new-group-name" className="input" value={name} onChange={(e) => setName(e.target.value)} placeholder="Weekend hikers" autoFocus />
+        </div>
+        <div className="field">
+          <label className="field-label" htmlFor="new-group-people">Invite people</label>
+          <input id="new-group-people" className="input" value={people} onChange={(e) => setPeople(e.target.value)} placeholder="GitHub usernames, like alice, bob" autoComplete="off" />
+        </div>
         <ErrorFlash error={error} />
         <div className="row" style={{ justifyContent: 'flex-end' }}>
           <button type="button" className="btn" onClick={onClose}>Cancel</button>

@@ -117,7 +117,7 @@ try {
   await bob.page.screenshot({ path: `${SHOTS}/group-bob.png` });
 
   // remove carol
-  await alice.page.getByRole('button', { name: /Members/ }).click();
+  await alice.page.getByRole('button', { name: 'Chat options' }).click();
   await alice.page.locator('.member', { hasText: 'carol' }).getByRole('button', { name: 'Remove' }).click();
   await alice.page.locator('.sys', { hasText: '@carol left' }).waitFor({ timeout: 30000 }).catch(() => {});
   await carol.page.locator('.sys, .flash', { hasText: /You were removed|no longer available/ }).first().waitFor({ timeout: 45000 });
@@ -183,14 +183,14 @@ try {
     await p.page.waitForTimeout(300);
   };
   const details = async (p) => {
-    if (!(await p.page.locator('aside.panel').count())) await p.page.getByRole('button', { name: /Details|Members/ }).click();
+    if (!(await p.page.locator('.chat-menu').count())) await p.page.getByRole('button', { name: 'Chat options' }).click();
   };
   const count = (p, name) => p.page.locator('.chat-item .name').getByText(name, { exact: true }).count();
 
   // Delete chat: bob clears his copy of the DM with alice; the chat stays live
   await openChat(bob, 'alice');
   await details(bob);
-  await bob.page.locator('aside.panel').getByRole('button', { name: 'Delete chat' }).click();
+  await bob.page.locator('.chat-menu').getByRole('button', { name: 'Delete chat' }).click();
   await bubble(bob, 'hi alice, it works').waitFor({ state: 'detached', timeout: 10000 });
   await openChat(alice, 'bob');
   await sendMsg(alice, 'after the clear');
@@ -200,7 +200,7 @@ try {
 
   // Close: alice (owner) closes the DM; bob learns why, keeps his copy, and starts a new one
   await details(alice);
-  await alice.page.locator('aside.panel').getByRole('button', { name: 'Close chat' }).click();
+  await alice.page.locator('.chat-menu').getByRole('button', { name: 'Close chat' }).click();
   await alice.page.locator('.sys.divider', { hasText: 'You closed this chat' }).waitFor({ timeout: 30000 });
   await bob.page.locator('.sys.divider', { hasText: '@alice closed this chat' }).waitFor({ timeout: 45000 });
   await openChat(alice2, 'bob');
@@ -228,7 +228,7 @@ try {
   await bubble(alice2, 'for both browsers').waitFor({ timeout: 60000 });
   await bubble(alice, 'for both browsers').waitFor({ timeout: 60000 });
   await details(alice);
-  await alice.page.locator('aside.panel').getByRole('button', { name: 'Delete chat' }).click();
+  await alice.page.locator('.chat-menu').getByRole('button', { name: 'Delete chat' }).click();
   await bubble(alice, 'for both browsers').waitFor({ state: 'detached', timeout: 10000 });
   await bubble(alice2, 'for both browsers').waitFor({ state: 'detached', timeout: 60000 });
   check((await count(alice2, 'bob')) === 1 && !(await bubble(alice2, 'after the clear').count()), "alice's delete reached her second browser; the chat stays");
@@ -239,7 +239,7 @@ try {
   // Quit: dave (not the owner) quits; alice sees he left, can't send, and closes
   await openChat(dave, 'alice');
   await details(dave);
-  await dave.page.locator('aside.panel').getByRole('button', { name: 'Quit chat' }).click();
+  await dave.page.locator('.chat-menu').getByRole('button', { name: 'Quit chat' }).click();
   await dave.page.locator('.sys.divider', { hasText: 'You left this chat' }).waitFor({ timeout: 30000 });
   await openChat(alice, 'dave');
   await alice.page.getByText('dave left this chat.').waitFor({ timeout: 60000 });
@@ -249,7 +249,7 @@ try {
   check(true, 'alice closed the chat dave quit');
   // Deleting an ended chat removes it from her other browser's list too
   await details(alice);
-  await alice.page.locator('aside.panel').getByRole('button', { name: 'Delete chat' }).click();
+  await alice.page.locator('.chat-menu').getByRole('button', { name: 'Delete chat' }).click();
   await alice.page.waitForTimeout(500);
   check((await count(alice, 'dave')) === 0, 'ended chat deleted from the list');
   let gone = false;
@@ -261,8 +261,8 @@ try {
 
   // Block: dave blocks alice; her next invitation is turned down without asking
   await details(dave);
-  await dave.page.locator('aside.panel').getByRole('button', { name: 'Block alice' }).click();
-  await dave.page.locator('aside.panel').getByRole('button', { name: 'Unblock alice' }).waitFor();
+  await dave.page.locator('.chat-menu').getByRole('button', { name: 'Block alice' }).click();
+  await dave.page.locator('.chat-menu').getByRole('button', { name: 'Unblock alice' }).waitFor();
   await alice.page.getByRole('button', { name: 'New chat' }).first().click();
   await alice.page.getByLabel('GitHub username').fill('dave');
   await alice.page.getByRole('button', { name: 'Start chat' }).click();
