@@ -86,9 +86,9 @@ try {
   await alice.page.screenshot({ path: `${SHOTS}/dm-alice.png` });
 
   // Verify safety number match on both sides
-  await alice.page.getByRole('button', { name: /Unverified/ }).click();
+  await menu(alice, 'Verify bob');
   const sa = await alice.page.locator('.safety').innerText();
-  await bob.page.getByRole('button', { name: /Unverified/ }).click();
+  await menu(bob, 'Verify alice');
   const sb = await bob.page.locator('.safety').innerText();
   check(sa === sb && sa.length > 50, 'safety numbers match');
   await alice.page.getByRole('button', { name: /mark as verified/ }).click();

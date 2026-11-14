@@ -176,14 +176,11 @@ export function Conversation({ session, convo }: { session: Session; convo: Conv
   );
 }
 
+/** Quiet by default: nothing for a normal chat, a green check once verified, a warning only when the key changed. */
 function TrustBadge({ peer, onClick }: { peer: PeerInfo; onClick: () => void }) {
-  if (peer.status === 'none' || peer.status === 'error') return null;
   if (peer.status === 'key-changed') return <button className="btn icon ghost trust warn" aria-label="Key changed" title="Key changed. Review the new safety number." onClick={onClick}>{Icon.shield(false, 16)}</button>;
-  return peer.verified ? (
-    <button className="btn icon ghost trust ok" aria-label="Verified" title="Verified" onClick={onClick}>{Icon.shield(true, 16)}</button>
-  ) : (
-    <button className="btn icon ghost trust warn" aria-label="Unverified" title="Not verified yet. Compare safety numbers." onClick={onClick}>{Icon.shield(false, 16)}</button>
-  );
+  if (peer.status !== 'none' && peer.status !== 'error' && peer.verified) return <button className="btn icon ghost trust ok" aria-label="Verified" title="Verified" onClick={onClick}>{Icon.shield(true, 16)}</button>;
+  return null;
 }
 
 function Message({ m, session, group, showAuthor, first = true, last = true }: { m: MsgRecord; session: Session; group?: Group; showAuthor: boolean; first?: boolean; last?: boolean }) {
