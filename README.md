@@ -190,4 +190,4 @@ npm run test:browser  # real Chromium + virtual PRF authenticator (needs playwri
 npm run build         # dist/
 ```
 
-Consume it from another repo with `"keyhold": "github:DreamC0der-AI/keyhold#v0.2.0"` (built on install). Pin a tag so an app only moves to a new keyhold on purpose.
+Consume it from another repo with `"keyhold": "github:DreamC0der-AI/keyhold#<commit or tag>"` (built on install). Pin a commit or tag so an app only moves to a new keyhold on purpose.
