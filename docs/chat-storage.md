@@ -6,7 +6,7 @@ Keyhold's chat side is built in three layers. Only the bottom one knows which ch
 | --- | --- | --- | --- |
 | 1. Requirements | `keyhold/storage` (`requirements.ts`) | Every data type, described only by who reads it, who writes it, how long it lives and what the storage must guarantee. The 12 storage kinds are **derived** from those requirements. | No |
 | 2. Protocol and policy | `keyhold/chat` | Identity (root key, device certificates, directory), MLS groups (RFC 9420, via ts-mls), group policy, invite tickets, personal synced store, root key backup | No |
-| 3. Providers | `keyhold/storage` interfaces; `keyhold/providers/github`; `MemoryWorld` | How each kind is stored, plus channel side effects (create a space, grant access, revoke access) | Yes |
+| 3. Providers | `keyhold/storage` interfaces and `MemoryWorld`; channel providers live in apps | How each kind is stored, plus channel side effects (create a space, grant access, revoke access) | Yes |
 
 Providers never see plaintext and never make a security decision. Channel access (for example GitHub collaborators) is a second fence against strangers and spam. Secrecy and integrity come from the encryption and signatures in layer 2.
 
@@ -54,20 +54,9 @@ Providers declare **capabilities**; the product declares **build options**; `res
 
 The same conformance tests (`tests/storage.test.ts`) run against every provider.
 
-### GitHub provider
+### Providers live in apps
 
-| Kind | Where |
-| --- | --- |
-| 3 | public repo `{login}/keyhold-id`, `dir/{index}` (create-only files) |
-| 9, 12 | private repo `{login}/keyhold-home`, `vault/{name}` and `items/{opaque id}` |
-| 5 | chat repo `log/{shard}/{index}`, create-only, 1,000 per shard |
-| 6 | chat repo `mail/{day}/{id}` |
-| 7 | chat repo `blob/{id}` (over 1 MB read through the git blob API) |
-| 8 | chat repo `drop/{recipient tag}/{id}` |
-| 11 | the existing Cloudflare Worker (`POST/GET/DELETE /invites`) |
-| 4 | not provided |
-
-Compare-and-swap comes from the Contents API: creating a path that exists fails, and an update needs the current blob sha. Channel side effects use the collaborator API. Chat repos are named `ghchat-<random>` with one neutral description and the topic `keyhold-chat`.
+Keyhold ships only the in-memory provider. Channel providers belong to the apps that use them. The GitHub provider, with its repo layout and its own run of these conformance tests, is in [chat-over-github](https://github.com/DreamC0der-AI/chat-over-github).
 
 ## 3. Identity
 
@@ -121,7 +110,8 @@ Commits that break a rule are rejected by every honest member, and the first mem
 
 ```ts
 import { MemoryWorld, resolveFeatures } from 'keyhold/storage';
-import { githubProvider } from 'keyhold/providers/github';
+// Any StorageProvider works. This one is from the chat-over-github app.
+import { githubProvider } from 'chat-over-github-provider';
 import { Chat, createRootKey, createDeviceIdentity, DirectoryWriter, IdentityRegistry, newDeviceId } from 'keyhold/chat';
 
 const provider = githubProvider({ fetch, token, login, workerUrl });

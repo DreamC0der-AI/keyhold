@@ -2,7 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import { MemoryWorld, memoryDevice } from '../src/storage/index.js';
 import { Chat, PersonalData, historyRecorder, encodeAppMessage, decodeAppMessage, type Group } from '../src/chat/index.js';
-import { makeUser, addDevice, githubWorld, texts } from './chat-helpers.js';
+import { makeUser, addDevice, texts } from './chat-helpers.js';
 
 const internals = (g: Group) => g as unknown as { meta: { logNext: number; space: string } };
 
@@ -122,18 +122,6 @@ describe('metadata hygiene', () => {
   });
 });
 
-describe('GitHub log sharding', () => {
-  it('keeps working past 1,000 entries (folder listing limit)', async () => {
-    const w = githubWorld();
-    const p = w.session('bob');
-    const s = await p.channel.createSpace('chat');
-    for (let i = 0; i < 1003; i++) expect(await p.orderedLog.append(s, i, new TextEncoder().encode(String(i)))).toBe('ok');
-    const tail = await p.orderedLog.read(s, 998);
-    expect(tail.map((b) => new TextDecoder().decode(b))).toEqual(['998', '999', '1000', '1001', '1002']);
-    expect([...w.gh.repos.get(s)!.files.keys()].filter((k) => k.startsWith('log/00001/'))).toHaveLength(3);
-  });
-});
-
 describe('history backup end to end', () => {
   it('a new device restores messages it was never there for', async () => {
     const w = new MemoryWorld();
@@ -158,21 +146,19 @@ describe('history backup end to end', () => {
 
 describe('multi-device space owner', () => {
   it("the owner's other device does not revoke someone with a pending invite", async () => {
-    const w = githubWorld();
-    const bob = await makeUser(w.session('bob'), 'github:bob');
+    const w = new MemoryWorld({ ownerManagedSpaces: true });
+    const bob = await makeUser(w.session('mem:bob'), 'mem:bob');
     const g = await bob.chat.createGroup();
     const tablet = await addDevice(bob);
     const [gt] = await tablet.chat.acceptInvites(); // bob's second device self-joins
     expect(gt).toBeDefined();
-    const carol = await makeUser(w.session('carol'), 'github:carol');
+    const carol = await makeUser(w.session('mem:carol'), 'mem:carol');
     await g.invite(carol.address); // from bob's laptop
     expect((await gt!.reconcileChannel(true)).revoked).toEqual([]); // the tablet finds the ticket
     const [gc] = await carol.chat.acceptInvites();
     expect(gc).toBeDefined();
     // and someone with access but no ticket is removed by either device
-    const mallory = w.gh.addUser('mallory');
-    void mallory;
-    await bob.provider.channel.grant(g.space, 'github:mallory');
-    expect((await gt!.reconcileChannel(true)).revoked).toEqual(['github:mallory']);
+    await bob.provider.channel.grant(g.space, 'mem:mallory');
+    expect((await gt!.reconcileChannel(true)).revoked).toEqual(['mem:mallory']);
   });
 });

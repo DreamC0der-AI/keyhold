@@ -39,19 +39,3 @@ export function world(opts?: ConstructorParameters<typeof MemoryWorld>[0]) {
 
 export const texts = (r: { messages: { message: { t: string; body?: string } }[] }) =>
   r.messages.filter((m) => m.message.t === 'text').map((m) => (m.message as { body: string }).body);
-
-import { MockGitHub } from './github-mock.js';
-import { githubProvider, toAddress } from '../src/providers/github/index.js';
-
-/** A GitHub "world": one mock GitHub, and a provider session per user. */
-export function githubWorld() {
-  const gh = new MockGitHub();
-  return {
-    gh,
-    session(login: string) {
-      const u = gh.users.get(login) ?? gh.addUser(login);
-      return githubProvider({ fetch: gh.fetch, token: u.token, login, workerUrl: gh.worker, apiBase: gh.api });
-    },
-    address: toAddress,
-  };
-}

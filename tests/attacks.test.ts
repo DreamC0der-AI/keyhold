@@ -8,7 +8,7 @@ import { MemoryWorld } from '../src/storage/index.js';
 import { ciphersuite, recipientTag, encodeTicket, signTicket, type Group } from '../src/chat/index.js';
 import { b64, jsonBytes } from '../src/util/codec.js';
 import { sha256 } from '../src/util/bytes.js';
-import { makeUser, addDevice, githubWorld, texts } from './chat-helpers.js';
+import { makeUser, addDevice, texts } from './chat-helpers.js';
 
 const internals = (g: Group) => g as unknown as { state: mls.ClientState; meta: { logNext: number; lastHash: string; space: string; groupId: string } };
 
@@ -203,17 +203,6 @@ describe('storage operator', () => {
     await expect(g.sync()).rejects.toMatchObject({ code: 'rewrite_detected' });
   });
 
-  it('a force-pushed log on GitHub is detected', async () => {
-    const w = githubWorld();
-    const bob = await makeUser(w.session('bob'), 'github:bob');
-    const alice = await makeUser(w.session('alice'), 'github:alice');
-    const g = await bob.chat.startDm(alice.address);
-    const [ga] = await alice.chat.acceptInvites();
-    await g.sync();
-    w.gh.rewrite(g.space, 'log/00000/00000001', new TextEncoder().encode('{"v":1,"i":1}'));
-    await expect(ga!.sync()).rejects.toMatchObject({ code: 'rewrite_detected' });
-  });
-
   it('a rewritten directory is detected by anyone who pinned it', async () => {
     const w = new MemoryWorld();
     const bob = await makeUser(w.session('mem:bob'), 'mem:bob');
@@ -224,27 +213,6 @@ describe('storage operator', () => {
     await expect(bob.registry.lookup(alice.address)).rejects.toBeTruthy();
   });
 
-  it('GitHub sees only ciphertext: no message, name or contact text in any repo file', async () => {
-    const w = githubWorld();
-    const bob = await makeUser(w.session('bob'), 'github:bob');
-    const alice = await makeUser(w.session('alice'), 'github:alice');
-    const g = await bob.chat.createGroup('group', 'Secret Society');
-    await g.invite(alice.address);
-    const [ga] = await alice.chat.acceptInvites();
-    await g.send({ t: 'text', body: 'the password is swordfish' });
-    await ga!.send({ t: 'react', ref: 'x', emoji: 'thumbs' });
-    await g.sendAttachment(new TextEncoder().encode('attachment plaintext'), { name: 'plans.pdf' });
-    expect(texts(await ga!.sync())).toEqual(['the password is swordfish']);
-    for (const [name, repo] of w.gh.repos) {
-      for (const [path, f] of repo.files) {
-        const text = f.content.toString('latin1');
-        for (const secret of ['swordfish', 'Secret Society', 'attachment plaintext', 'plans.pdf', 'thumbs']) {
-          expect(`${name}/${path}: ${text.includes(secret)}`).toBe(`${name}/${path}: false`);
-        }
-      }
-      expect(repo.description).not.toMatch(/Secret|alice|bob/);
-    }
-  });
 });
 
 describe('forward secrecy', () => {

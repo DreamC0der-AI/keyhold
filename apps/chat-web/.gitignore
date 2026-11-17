@@ -1,4 +1,0 @@
-node_modules
-dist
-dist-mock
-tools/mock-server.mjs

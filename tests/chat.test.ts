@@ -1,17 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { MemoryWorld, type StorageProvider } from '../src/storage/index.js';
 import { safetyNumber, PersonalData, backupRootKey, restoreRootKey, createRootKey, DirectoryWriter, IdentityRegistry, MemoryPinStore } from '../src/chat/index.js';
-import { makeUser, addDevice, githubWorld, texts, type TestUserOptions } from './chat-helpers.js';
+import { makeUser, addDevice, texts, type TestUserOptions } from './chat-helpers.js';
 
 type World = { name: string; session(u: string): StorageProvider; addr(u: string): string; raw: unknown };
 const worlds: [string, () => World][] = [
   ['memory', () => {
     const w = new MemoryWorld({ ownerManagedSpaces: true });
     return { name: 'memory', session: (u) => w.session(`mem:${u}`), addr: (u) => `mem:${u}`, raw: w };
-  }],
-  ['github (mock)', () => {
-    const w = githubWorld();
-    return { name: 'github', session: (u) => w.session(u), addr: (u) => `github:${u}`, raw: w };
   }],
 ];
 
@@ -206,14 +202,14 @@ describe('build option: offline add (box 4)', () => {
     expect(await w.session('mem:carol').claimOnce!.remaining()).toBe(2);
   });
 
-  it('is unavailable when the provider lacks claim-once (GitHub)', async () => {
-    const w = githubWorld();
-    const bob = await makeUser(w.session('bob'), 'github:bob', { build: { offlineAdd: true } });
+  it('is unavailable when the provider lacks claim-once', async () => {
+    const w = new MemoryWorld({ claimOnce: false });
+    const bob = await makeUser(w.session('mem:bob'), 'mem:bob', { build: { offlineAdd: true } });
     expect(bob.features.offlineAdd).toBe(false);
     await expect(bob.chat.publishKeyPackages(1)).rejects.toMatchObject({ code: 'unsupported' });
     const g = await bob.chat.createGroup();
-    await makeUser(w.session('carol'), 'github:carol');
-    await expect(g.addOffline('github:carol')).rejects.toMatchObject({ code: 'unsupported' });
+    await makeUser(w.session('mem:carol'), 'mem:carol');
+    await expect(g.addOffline('mem:carol')).rejects.toMatchObject({ code: 'unsupported' });
   });
 
   it('last-resort KeyPackage from the directory when the claim-once store is empty', async () => {
@@ -230,19 +226,19 @@ describe('build option: offline add (box 4)', () => {
   });
 });
 
-describe('owner-managed channels (GitHub): other admins ask the owner app', () => {
+describe('owner-managed channels (e.g. GitHub): other admins ask the owner app', () => {
   it('a non-owner admin invites; the owner app grants access', async () => {
-    const w = githubWorld();
-    const bob = await makeUser(w.session('bob'), 'github:bob');
-    const carol = await makeUser(w.session('carol'), 'github:carol');
-    const dave = await makeUser(w.session('dave'), 'github:dave');
+    const w = new MemoryWorld({ ownerManagedSpaces: true });
+    const bob = await makeUser(w.session('mem:bob'), 'mem:bob');
+    const carol = await makeUser(w.session('mem:carol'), 'mem:carol');
+    const dave = await makeUser(w.session('mem:dave'), 'mem:dave');
     const g = await bob.chat.createGroup();
     await g.invite(carol.address);
     const [gc] = await carol.chat.acceptInvites();
     await g.sync();
     await g.setPolicy({ ...g.policy, admins: [bob.identity.fingerprint, carol.identity.fingerprint] });
     await gc!.sync();
-    await gc!.invite(dave.address); // carol isn't the repo owner: posts a sys.grant request
+    await gc!.invite(dave.address); // carol isn't the space owner: posts a sys.grant request
     expect(await dave.chat.acceptInvites()).toEqual([]); // nothing yet
     await g.sync(); // bob's app sees carol (an admin) asked, and grants channel access
     const [gd] = await dave.chat.acceptInvites();

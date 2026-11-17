@@ -10,7 +10,6 @@ import {
   MemoryWorld,
   type StorageProvider,
 } from '../src/storage/index.js';
-import { githubWorld } from './chat-helpers.js';
 
 // The agreed mapping from the design (group-encryption-design.md, sections 4 and 6).
 const EXPECTED: Record<string, number | typeof NOT_STORED> = {
@@ -75,14 +74,14 @@ describe('data types are defined by requirements; kinds are derived', () => {
   it('features follow build options and provider capabilities', () => {
     const mem = new MemoryWorld().session('a');
     const noClaim = new MemoryWorld({ claimOnce: false }).session('a');
-    const gh = githubWorld().session('a');
+    const ownerOnly = new MemoryWorld({ claimOnce: false, ownerManagedSpaces: true }).session('a');
     expect(resolveFeatures(mem, { offlineAdd: true }).offlineAdd).toBe(true);
     expect(resolveFeatures(mem, {}).offlineAdd).toBe(false);
     expect(resolveFeatures(noClaim, { offlineAdd: true }).offlineAdd).toBe(false);
-    expect(resolveFeatures(gh, { offlineAdd: true }).offlineAdd).toBe(false);
-    expect(() => resolveFeatures(gh, { offlineAdd: true }, true)).toThrow(/claim-once/);
-    expect(resolveFeatures(gh).ownerManagedSpaces).toBe(true);
-    expect(resolveFeatures(gh).historyBackup).toBe(true);
+    expect(() => resolveFeatures(noClaim, { offlineAdd: true }, true)).toThrow(/claim-once/);
+    expect(resolveFeatures(ownerOnly).ownerManagedSpaces).toBe(true);
+    expect(resolveFeatures(mem).ownerManagedSpaces).toBe(false);
+    expect(resolveFeatures(mem).historyBackup).toBe(true);
   });
 });
 
@@ -93,10 +92,6 @@ const providers: [string, Factory][] = [
   ['memory', () => {
     const w = new MemoryWorld({ ownerManagedSpaces: true });
     return { session: (u) => w.session(`mem:${u}`), addr: (u) => `mem:${u}` };
-  }],
-  ['github (mock)', () => {
-    const w = githubWorld();
-    return { session: (u) => w.session(u), addr: (u) => `github:${u}` };
   }],
 ];
 const bytes = (s: string) => new TextEncoder().encode(s);

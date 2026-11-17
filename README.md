@@ -11,7 +11,7 @@ meet through small interfaces. Diorama Memory is the first user; nothing here is
 | Seed phrases | `keyhold/seed` | BIP39 helpers shared by the seed login and seed recovery. | anywhere |
 | Storage model | `keyhold/storage` | Every chat data type as a requirement (who reads, who writes, how long it lives), the 12 storage kinds derived from them, provider interfaces and capabilities, and an in-memory provider. | anywhere |
 | Chat | `keyhold/chat` | End-to-end encrypted DMs and groups on MLS (RFC 9420): identity and directory, group policy and invite tickets, personal synced store, root key backup. Channel-free. | anywhere with WebCrypto |
-| GitHub provider | `keyhold/providers/github` | Stores each kind in GitHub repos and uses collaborator access as the channel fence. Never sees plaintext. | browser, Workers, Node |
+| Helpers | `keyhold/util` | Bytes, base64url, canonical JSON, HKDF and `KeyholdError`, for apps and providers built on keyhold. | anywhere |
 
 The interfaces between them:
 
@@ -45,9 +45,9 @@ Keyhold also powers end-to-end encrypted chat (DMs and groups, on MLS). We start
 | 11 | Invite inbox | anyone writes, recipient reads | invite notices (server-enforced) |
 | 12 | Personal synced store | only you, all devices | contacts, chat list, read marks, settings, history backup |
 
-On GitHub each person has a public directory repo (3) and a private home repo (9, 12). Each chat is its own private repo (5 to 8), and repo collaborators act as a second fence. The existing Worker serves the invite inbox (11).
+Keyhold itself has no channel code: it ships only an in-memory provider for tests. Apps bring their own provider. [Chat over GitHub](https://github.com/DreamC0der-AI/chat-over-github) is the first: it maps each kind to GitHub repos and serves the invite inbox (11) from a small Worker.
 
-Design: [docs/chat-storage.md](docs/chat-storage.md). Audit, known limits and the live GitHub run: [docs/chat-audit.md](docs/chat-audit.md).
+Design: [docs/chat-storage.md](docs/chat-storage.md). Audit and known limits: [docs/chat-audit.md](docs/chat-audit.md).
 
 ## How the key scheme works
 
@@ -190,4 +190,4 @@ npm run test:browser  # real Chromium + virtual PRF authenticator (needs playwri
 npm run build         # dist/
 ```
 
-Consume it from another repo with `"keyhold": "github:DreamC0der-AI/keyhold"` (built on install).
+Consume it from another repo with `"keyhold": "github:DreamC0der-AI/keyhold#v0.2.0"` (built on install). Pin a tag so an app only moves to a new keyhold on purpose.

@@ -1,6 +1,6 @@
 # Chat and storage: audit
 
-Scope: `src/storage`, `src/chat`, `src/providers/github`, as of this change. Method: a review of the design and code against the threat model below, then a test for each finding. ts-mls itself was not audited (its own README says it has had no formal audit).
+Scope: `src/storage`, `src/chat`, and the GitHub provider (since moved to chat-over-github), as of this change. Method: a review of the design and code against the threat model below, then a test for each finding. ts-mls itself was not audited (its own README says it has had no formal audit).
 
 ## Threat model
 
@@ -61,23 +61,4 @@ All with tests in `tests/attacks.test.ts` and `tests/chat.test.ts`:
 
 ## Live run against real GitHub
 
-On 2026-11-05, `scripts/live-github.ts` passed all 16 steps with two real accounts. Each account had the GitHub App installed with "Only select repositories". The run checked:
-
-- publishing directories and looking them up across accounts;
-- a DM (repo, ticket, collaborator invite, Worker inbox, accept, external join, messages both ways);
-- a 1.5 MB attachment through the git blob API;
-- compare-and-swap with two writers racing on the same log index five times (exactly one won each time);
-- a group invite, join and talk;
-- a member leaving, which removed them as a collaborator;
-- a removal, after which the removed member sees `access-lost` and can't read the log.
-
-An idle sync costs 5 requests for both owner and member, the same as against the mock.
-
-Still not covered live:
-
-- 409s caused by unrelated commits racing on the branch under heavy load;
-- files near the size limit;
-- the request budget over hours of polling (at 5,000 requests an hour, polling every minute covers about 16 chats, so a real app should poll quiet chats less often);
-- the offline add path (box 4), which the GitHub provider doesn't offer.
-
-Run it again with `npm run build:live && node scripts/live-github.mjs <loginA> <loginB>`. The script uses its own repo names (`keyhold-live-*`, `ghchat-live-*`), deletes them at the end, and never writes tokens or keys to its report.
+The GitHub provider and its live check moved to [chat-over-github](https://github.com/DreamC0der-AI/chat-over-github) (`docs/github-provider.md`). It passed all 16 steps on 2026-11-05.
