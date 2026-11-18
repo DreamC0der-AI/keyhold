@@ -21,4 +21,15 @@ export type KeyholdErrorCode =
   | 'auth_failed'
   | 'code_expired'
   | 'too_many_attempts'
-  | 'config';
+  | 'config'
+  // storage and chat
+  | 'forbidden' // the storage refused this caller (access rule of the storage kind)
+  | 'conflict' // a compare-and-swap write lost a race; re-read and retry
+  | 'not_found'
+  | 'unsupported' // the storage provider lacks a capability this feature needs
+  | 'rewrite_detected' // a hash-chained log or directory was rewritten
+  | 'key_changed' // a contact's root identity key differs from the pinned one
+  | 'bad_signature'
+  | 'policy_rejected' // the group policy forbids this change
+  | 'not_member'
+  | 'expired';
