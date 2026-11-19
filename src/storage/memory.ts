@@ -228,9 +228,17 @@ function memorySession(w: MemoryWorld, self: Address): StorageProvider {
     },
     mailbox: {
       async post(ref, data) {
+        w.count('mailbox.post');
         const id = rid();
         space(ref).mail.push({ id, data: copy(data) });
         return id;
+      },
+      async postMany(ref, data) {
+        w.count('mailbox.postMany');
+        const s = space(ref);
+        const items = data.map((d) => ({ id: rid(), data: copy(d) }));
+        s.mail.push(...items);
+        return items.map((i) => i.id);
       },
       async list(ref, cursor) {
         const s = space(ref);

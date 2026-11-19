@@ -199,4 +199,58 @@ describe('concurrent calls on one group', () => {
     expect(texts(r).sort()).toEqual(['a', 'after', 'b']);
     expect(ga!.epoch).toBe(g.epoch);
   });
+
+  it('sends made while one is going out are posted together, in order, each with its own key', async () => {
+    const w = new MemoryWorld();
+    const bob = await makeUser(w.session('mem:bob'), 'mem:bob');
+    const alice = await makeUser(w.session('mem:alice'), 'mem:alice');
+    const g = await bob.chat.startDm(alice.address);
+    const [ga] = await alice.chat.acceptInvites();
+    const phone = await addDevice(alice);
+    const [gp] = await phone.chat.acceptInvites();
+    await g.sync();
+    await ga!.sync();
+    await gp!.sync();
+    const before = { post: w.calls.get('mailbox.post') ?? 0, many: w.calls.get('mailbox.postMany') ?? 0, log: w.calls.get('log.read') ?? 0 };
+    // Typed quickly: 1 goes out at once, 2 to 4 arrive while it is in flight.
+    const first = g.send({ t: 'text', body: '1' });
+    await Promise.resolve();
+    const rest = ['2', '3', '4'].map((body) => g.send({ t: 'text', body }));
+    const sent = await Promise.all([first, ...rest]);
+    expect(sent.map((m) => (m as { body: string }).body)).toEqual(['1', '2', '3', '4']);
+    expect(new Set(sent.map((m) => m.id)).size).toBe(4);
+    for (let i = 1; i < sent.length; i++) expect(sent[i]!.ts).toBeGreaterThan(sent[i - 1]!.ts);
+    // One write for the first, one for the other three, and one pull before each.
+    expect((w.calls.get('mailbox.post') ?? 0) - before.post).toBe(1);
+    expect((w.calls.get('mailbox.postMany') ?? 0) - before.many).toBe(1);
+    expect((w.calls.get('log.read') ?? 0) - before.log).toBe(2);
+    for (const r of [await ga!.sync(), await gp!.sync()]) {
+      expect(r.events.filter((e) => e.type === 'undecryptable')).toEqual([]);
+      expect(texts(r)).toEqual(['1', '2', '3', '4']);
+    }
+  });
+
+  it('a failed batch fails each of its sends, and the next send still works', async () => {
+    const w = new MemoryWorld();
+    const bob = await makeUser(w.session('mem:bob'), 'mem:bob');
+    const alice = await makeUser(w.session('mem:alice'), 'mem:alice');
+    const g = await bob.chat.startDm(alice.address);
+    const [ga] = await alice.chat.acceptInvites();
+    await g.sync();
+    const mailbox = bob.provider.mailbox;
+    const realMany = mailbox.postMany!;
+    mailbox.postMany = async () => {
+      throw new Error('network down');
+    };
+    const first = g.send({ t: 'text', body: 'a' });
+    await Promise.resolve();
+    const results = await Promise.allSettled([first, g.send({ t: 'text', body: 'b' }), g.send({ t: 'text', body: 'c' })]);
+    expect(results.map((r) => r.status)).toEqual(['fulfilled', 'rejected', 'rejected']);
+    mailbox.postMany = realMany;
+    await g.send({ t: 'text', body: 'b again' });
+    const r = await ga!.sync();
+    // The lost batch only leaves a gap in the ratchet; nothing after it is undecryptable.
+    expect(r.events.filter((e) => e.type === 'undecryptable')).toEqual([]);
+    expect(texts(r)).toEqual(['a', 'b again']);
+  });
 });
