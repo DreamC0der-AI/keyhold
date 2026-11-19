@@ -659,6 +659,15 @@ function decodeTree(b: Uint8Array): mls.RatchetTree {
   return r[0];
 }
 
+/** Most messages posted in one write. */
+const MAX_BATCH = 50;
+
+interface PendingSend {
+  content: AppContent;
+  resolve: (m: AppMessage) => void;
+  reject: (e: unknown) => void;
+}
+
 /** One conversation on this device. */
 export class Group {
   private syncing: Promise<SyncResult> | undefined;
@@ -735,39 +744,86 @@ export class Group {
   // ---- Sending ----
 
   private exclusive<T>(fn: () => Promise<T>): Promise<T> {
+    // Anything queued after an open batch runs after it, so later sends must not join it.
+    this.openBatch = undefined;
     const run = this.queue.then(fn, fn);
     this.queue = run.catch(() => undefined);
     return run;
   }
 
-  /** Encrypt and post one message. Rotates keys first when the rotation policy says so. */
+  /**
+   * Sends waiting for their turn, shipped together when it comes. A send that finds the queue
+   * free goes out at once (a batch of one); sends made while it is in flight collect here and
+   * go out as one write when it finishes, each still its own message with its own key.
+   */
+  private openBatch: PendingSend[] | undefined;
+
+  /**
+   * Encrypt and post one message. Rotates keys first when the rotation policy says so.
+   * Sends made while an earlier one is still going out are posted together, in order.
+   */
   send(content: AppContent): Promise<AppMessage> {
-    return this.exclusive(() => this.sendNow(content));
+    return new Promise<AppMessage>((resolve, reject) => {
+      const item: PendingSend = { content, resolve, reject };
+      if (this.openBatch && this.openBatch.length < MAX_BATCH) {
+        this.openBatch.push(item);
+        return;
+      }
+      const batch: PendingSend[] = [item];
+      void this.exclusive(async () => {
+        if (this.openBatch === batch) this.openBatch = undefined; // its turn: it is closed now
+        try {
+          const sent = await this.sendNow(batch.map((b) => b.content));
+          batch.forEach((b, i) => b.resolve(sent[i]!));
+        } catch (e) {
+          batch.forEach((b) => b.reject(e));
+        }
+      });
+      this.openBatch = batch;
+    });
   }
 
-  private async sendNow(content: AppContent): Promise<AppMessage> {
+  /** Encrypt several messages in order, each with its own key, and post them in one write. */
+  private async sendNow(contents: AppContent[]): Promise<AppMessage[]> {
     this.requireActive();
     // Never encrypt for a stale epoch: members who joined or rotated since couldn't read it.
     await this.pull();
     this.requireActive();
     if (this.rotationDue()) await this.commit([]);
     const cs = await ciphersuite();
-    const message = { v: 1, id: newMessageId(), ts: this.chat.now(), ...content } as AppMessage;
-    const res = await mls.createApplicationMessage(this.state, encodeAppMessage(message), cs);
-    this.state = res.newState;
-    this.meta.sentSinceUpdate++;
+    const messages: AppMessage[] = [];
+    const wires: Uint8Array[] = [];
+    for (const content of contents) {
+      // Strictly increasing times, so a burst keeps its order wherever it is sorted by time.
+      const ts = Math.max(this.chat.now(), this.lastSentTs + 1);
+      this.lastSentTs = ts;
+      const message = { v: 1, id: newMessageId(), ts, ...content } as AppMessage;
+      const res = await mls.createApplicationMessage(this.state, encodeAppMessage(message), cs);
+      this.state = res.newState;
+      this.meta.sentSinceUpdate++;
+      res.consumed.forEach(mls.zeroOutUint8Array);
+      messages.push(message);
+      wires.push(encodeMsg({ wireformat: 'mls_private_message', version: 'mls10', privateMessage: res.privateMessage }));
+    }
     // Persist the advanced ratchet BEFORE the ciphertext leaves: a crash must never lead to a
     // second message with the same generation (nonce reuse).
     await this.persist();
-    res.consumed.forEach(mls.zeroOutUint8Array);
-    const wire = encodeMsg({ wireformat: 'mls_private_message', version: 'mls10', privateMessage: res.privateMessage });
-    const id = await this.chat.provider.mailbox.post(this.meta.space, wire);
-    this.meta.ownMail.push(id);
+    const mailbox = this.chat.provider.mailbox;
+    let ids: string[];
+    if (wires.length > 1 && mailbox.postMany) ids = await mailbox.postMany(this.meta.space, wires);
+    else {
+      ids = [];
+      for (const w of wires) ids.push(await mailbox.post(this.meta.space, w));
+    }
+    this.meta.ownMail.push(...ids);
     await this.persist();
     const me = this.chat.identity;
-    await this.chat.opts.onMessage?.(this, { message, from: { fingerprint: me.fingerprint, address: me.address, deviceId: me.deviceId }, epoch: this.epoch });
-    return message;
+    for (const message of messages) {
+      await this.chat.opts.onMessage?.(this, { message, from: { fingerprint: me.fingerprint, address: me.address, deviceId: me.deviceId }, epoch: this.epoch });
+    }
+    return messages;
   }
+  private lastSentTs = 0;
 
   /** Seal an attachment with a fresh key, upload it (box 7) and send the reference. */
   async sendAttachment(data: Uint8Array, info: { name?: string; mime?: string; caption?: string } = {}) {
@@ -883,7 +939,7 @@ export class Group {
       await p.inviteInbox.send(address, { pointer: r.pointer });
     } else if (r.status === 'needs-manager') {
       // Only the space owner can let people in on this channel: ask their app (it checks we are an admin).
-      await this.sendNow({ t: 'sys.grant', address, expiresAt });
+      await this.sendNow([{ t: 'sys.grant', address, expiresAt }]);
     }
   }
 

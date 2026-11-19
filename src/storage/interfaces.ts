@@ -99,6 +99,12 @@ export interface MailboxItem {
 /** Box 6. Append in any order. The cursor is opaque and provider-defined. */
 export interface Mailbox {
   post(space: SpaceRef, data: Bytes): Promise<string>;
+  /**
+   * Optional: post several items in one write, all or none, and return their ids in order.
+   * Readers see them as ordinary items, listed in the order given. Without it, callers post
+   * one at a time.
+   */
+  postMany?(space: SpaceRef, data: Bytes[]): Promise<string[]>;
   list(space: SpaceRef, cursor?: string): Promise<{ items: MailboxItem[]; cursor: string }>;
 }
 
