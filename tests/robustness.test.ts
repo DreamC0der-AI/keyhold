@@ -162,3 +162,41 @@ describe('multi-device space owner', () => {
     expect((await gt!.reconcileChannel(true)).revoked).toEqual(['mem:mallory']);
   });
 });
+
+describe('concurrent calls on one group', () => {
+  it('messages sent back to back without waiting reach every device of the receiver', async () => {
+    const w = new MemoryWorld();
+    const bob = await makeUser(w.session('mem:bob'), 'mem:bob');
+    const alice = await makeUser(w.session('mem:alice'), 'mem:alice');
+    const g = await bob.chat.startDm(alice.address);
+    const [ga] = await alice.chat.acceptInvites();
+    const phone = await addDevice(alice);
+    const [gp] = await phone.chat.acceptInvites();
+    expect(gp).toBeDefined();
+    await g.sync();
+    await ga!.sync();
+    await g.send({ t: 'text', body: 'one' });
+    // Two sends started together (the user pressed Enter twice quickly), plus a sync racing them.
+    await Promise.all([g.send({ t: 'text', body: 'two' }), g.send({ t: 'text', body: 'three' }), g.sync()]);
+    for (const r of [await ga!.sync(), await gp!.sync()]) {
+      expect(r.events.filter((e) => e.type === 'undecryptable')).toEqual([]);
+      expect(texts(r).sort()).toEqual(['one', 'three', 'two']);
+    }
+  });
+
+  it('a sync racing a send or a commit never loses either change', async () => {
+    const w = new MemoryWorld();
+    const bob = await makeUser(w.session('mem:bob'), 'mem:bob');
+    const alice = await makeUser(w.session('mem:alice'), 'mem:alice');
+    const g = await bob.chat.startDm(alice.address);
+    const [ga] = await alice.chat.acceptInvites();
+    await g.sync();
+    await ga!.send({ t: 'text', body: 'from alice' });
+    await Promise.all([g.sync(), g.send({ t: 'text', body: 'a' }), g.rotate(), g.send({ t: 'text', body: 'b' }), g.sync()]);
+    await g.send({ t: 'text', body: 'after' });
+    const r = await ga!.sync();
+    expect(r.events.filter((e) => e.type === 'undecryptable' || e.type === 'rejected')).toEqual([]);
+    expect(texts(r).sort()).toEqual(['a', 'after', 'b']);
+    expect(ga!.epoch).toBe(g.epoch);
+  });
+});

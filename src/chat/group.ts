@@ -662,6 +662,14 @@ function decodeTree(b: Uint8Array): mls.RatchetTree {
 /** One conversation on this device. */
 export class Group {
   private syncing: Promise<SyncResult> | undefined;
+  /**
+   * Every change to the MLS state runs one at a time. Two sends started together would
+   * otherwise both encrypt from the same state: same generation, so the same key and nonce
+   * twice, and each receiver could open only one of them. A sync racing a send or commit
+   * would likewise overwrite the other's new state. Public methods queue here; internal
+   * helpers (the *Now methods, pull, commit) assume the queue is already held.
+   */
+  private queue: Promise<unknown> = Promise.resolve();
   private lastMembership = '';
   private lastRequests = 0;
   /** Messages and events found by internal syncs (before a send or commit), returned by the next sync(). */
@@ -726,13 +734,23 @@ export class Group {
 
   // ---- Sending ----
 
+  private exclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.queue.then(fn, fn);
+    this.queue = run.catch(() => undefined);
+    return run;
+  }
+
   /** Encrypt and post one message. Rotates keys first when the rotation policy says so. */
-  async send(content: AppContent): Promise<AppMessage> {
+  send(content: AppContent): Promise<AppMessage> {
+    return this.exclusive(() => this.sendNow(content));
+  }
+
+  private async sendNow(content: AppContent): Promise<AppMessage> {
     this.requireActive();
     // Never encrypt for a stale epoch: members who joined or rotated since couldn't read it.
     await this.pull();
     this.requireActive();
-    if (this.rotationDue()) await this.rotate();
+    if (this.rotationDue()) await this.commit([]);
     const cs = await ciphersuite();
     const message = { v: 1, id: newMessageId(), ts: this.chat.now(), ...content } as AppMessage;
     const res = await mls.createApplicationMessage(this.state, encodeAppMessage(message), cs);
@@ -778,7 +796,11 @@ export class Group {
    * Invite someone: write an admin-signed ticket to their drop box (box 8), give them channel
    * access and drop a notice in their inbox (box 11). They join when they accept.
    */
-  async invite(address: Address, options: { requireIdentity?: boolean; ttlMs?: number } = {}): Promise<InviteTicket> {
+  invite(address: Address, options: { requireIdentity?: boolean; ttlMs?: number } = {}): Promise<InviteTicket> {
+    return this.exclusive(() => this.inviteNow(address, options));
+  }
+
+  private async inviteNow(address: Address, options: { requireIdentity?: boolean; ttlMs?: number }): Promise<InviteTicket> {
     this.requireActive();
     await this.pull();
     const me = this.chat.identity;
@@ -861,12 +883,16 @@ export class Group {
       await p.inviteInbox.send(address, { pointer: r.pointer });
     } else if (r.status === 'needs-manager') {
       // Only the space owner can let people in on this channel: ask their app (it checks we are an admin).
-      await this.send({ t: 'sys.grant', address, expiresAt });
+      await this.sendNow({ t: 'sys.grant', address, expiresAt });
     }
   }
 
   /** Add someone who is offline, using a one-time KeyPackage from box 4 (build option). */
-  async addOffline(address: Address) {
+  addOffline(address: Address) {
+    return this.exclusive(() => this.addOfflineNow(address));
+  }
+
+  private async addOfflineNow(address: Address) {
     this.requireActive();
     const f = this.chat.opts.features;
     if (!f.offlineAdd) throw new KeyholdError('unsupported', 'offline add is not enabled');
@@ -889,7 +915,11 @@ export class Group {
   }
 
   /** Remove a person (all their devices). MLS first, then channel access. */
-  async remove(fingerprintToRemove: string) {
+  remove(fingerprintToRemove: string) {
+    return this.exclusive(() => this.removeNow(fingerprintToRemove));
+  }
+
+  private async removeNow(fingerprintToRemove: string) {
     this.requireActive();
     await this.pull();
     const targets = leaves(this.state).filter((l) => l.root === fingerprintToRemove);
@@ -897,17 +927,23 @@ export class Group {
     const address = targets[0]!.address;
     await this.commit(targets.map((t) => ({ proposalType: 'remove', remove: { removed: t.leafIndex } }) as mls.Proposal));
     await this.persist();
-    await this.reconcileChannel(true);
+    await this.reconcileNow(true);
   }
 
   /** Remove one of my own other devices (lost or replaced). */
-  async removeDevice(devicePublicB64: string) {
-    const t = leaves(this.state).find((l) => l.device === devicePublicB64);
-    if (t) await this.commit([{ proposalType: 'remove', remove: { removed: t.leafIndex } }]);
+  removeDevice(devicePublicB64: string) {
+    return this.exclusive(async () => {
+      const t = leaves(this.state).find((l) => l.device === devicePublicB64);
+      if (t) await this.commit([{ proposalType: 'remove', remove: { removed: t.leafIndex } }]);
+    });
   }
 
   /** Leave: remove my other devices, propose removing this one; another member commits it. */
-  async leave() {
+  leave() {
+    return this.exclusive(() => this.leaveNow());
+  }
+
+  private async leaveNow() {
     this.requireActive();
     await this.pull();
     const me = this.chat.identity.fingerprint;
@@ -916,7 +952,7 @@ export class Group {
     if (policy.admins.length === 1 && policy.admins[0] === me && others.length > 0) {
       // Don't strand the group without an admin: promote the longest-standing other member.
       const next = others.sort((a, b) => a.leafIndex - b.leafIndex)[0]!.root;
-      await this.setPolicy({ ...policy, admins: [next] });
+      await this.setPolicyNow({ ...policy, admins: [next] });
     }
     const mine = leaves(this.state).filter((l) => l.root === me && l.leafIndex !== this.myLeaf);
     if (mine.length) await this.commit(mine.map((t) => ({ proposalType: 'remove', remove: { removed: t.leafIndex } }) as mls.Proposal));
@@ -930,14 +966,20 @@ export class Group {
   }
 
   /** Change the policy (admins only). `change` gets the current policy, so a retry after a race re-applies the change. */
-  async setPolicy(policy: GroupPolicy | ((current: GroupPolicy) => GroupPolicy)) {
+  setPolicy(policy: GroupPolicy | ((current: GroupPolicy) => GroupPolicy)) {
+    return this.exclusive(() => this.setPolicyNow(policy));
+  }
+
+  private async setPolicyNow(policy: GroupPolicy | ((current: GroupPolicy) => GroupPolicy)) {
     await this.commit(() => [this.policyProposal(typeof policy === 'function' ? policy(this.policy) : policy)]);
   }
 
   /** Ban a device (one of mine, or anyone's if I'm an admin) so it can never rejoin, and remove it. */
-  async banDevice(devicePublicB64: string) {
-    const l = leaves(this.state).find((x) => x.device === devicePublicB64);
-    await this.banAndRemove([{ device: devicePublicB64, root: l?.root ?? this.chat.identity.fingerprint }]);
+  banDevice(devicePublicB64: string) {
+    return this.exclusive(async () => {
+      const l = leaves(this.state).find((x) => x.device === devicePublicB64);
+      await this.banAndRemove([{ device: devicePublicB64, root: l?.root ?? this.chat.identity.fingerprint }]);
+    });
   }
 
   /**
@@ -957,8 +999,10 @@ export class Group {
   }
 
   /** Post a fresh key update (new epoch). Done automatically by the rotation policy. */
-  async rotate() {
-    await this.commit([]);
+  rotate() {
+    return this.exclusive(async () => {
+      await this.commit([]);
+    });
   }
 
   rotationDue(): boolean {
@@ -970,8 +1014,10 @@ export class Group {
    * End this room on this device (after Close, Quit, or a close from the owner): delete the
    * epoch and ratchet secrets right away. Messages already decrypted are the app's business.
    */
-  async end() {
-    if (!this.meta.removed) await this.forget();
+  end() {
+    return this.exclusive(async () => {
+      if (!this.meta.removed) await this.forget();
+    });
   }
 
   private async forget() {
@@ -1071,16 +1117,17 @@ export class Group {
 
   /** Pull the log and the mailbox, apply commits in order, decrypt messages. */
   async sync(): Promise<SyncResult> {
-    await this.pull();
+    // Calls that overlap share one queued pull.
+    if (!this.syncing) this.syncing = this.exclusive(() => this.syncInner(true)).finally(() => (this.syncing = undefined));
+    await this.syncing;
     const out = this.buffered;
     this.buffered = { messages: [], events: [] };
     return out;
   }
 
-  /** Bring the group up to date; results are buffered for the next sync(). */
+  /** Bring the group up to date; results are buffered for the next sync(). Caller holds the queue. */
   private async pull(): Promise<void> {
-    if (!this.syncing) this.syncing = this.syncInner(true).finally(() => (this.syncing = undefined));
-    await this.syncing;
+    await this.syncInner(true);
   }
 
   private async syncInner(withAutomation: boolean): Promise<SyncResult> {
@@ -1353,7 +1400,7 @@ export class Group {
         if ((err as KeyholdError).code !== 'policy_rejected') throw err;
       }
     } else if (this.rotationDue()) {
-      await this.rotate();
+      await this.commit([]);
       out.events.push({ type: 'rotated', epoch: this.epoch });
     }
     // Only admins issue tickets, so only they answer join requests: on every sync while this
@@ -1364,7 +1411,7 @@ export class Group {
       this.lastRequests = now;
       await this.answerJoinRequests();
     }
-    await this.reconcileChannel();
+    await this.reconcileNow();
   }
 
   /**
@@ -1373,7 +1420,11 @@ export class Group {
    * reads tickets from the drop boxes), so every device of the space owner gets the same answer.
    * Runs when membership changed, or at most every 10 minutes.
    */
-  async reconcileChannel(force = false): Promise<{ revoked: Address[] }> {
+  reconcileChannel(force = false): Promise<{ revoked: Address[] }> {
+    return this.exclusive(() => this.reconcileNow(force));
+  }
+
+  private async reconcileNow(force = false): Promise<{ revoked: Address[] }> {
     const ch = this.chat.provider.channel;
     if (!this.active || !(await ch.canManage(this.meta.space))) return { revoked: [] };
     const now = this.chat.now();
