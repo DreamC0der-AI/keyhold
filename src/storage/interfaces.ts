@@ -54,6 +54,19 @@ export interface PublicDirectory {
   append(index: number, entry: Bytes): Promise<CasResult>;
 }
 
+/**
+ * Box 3b (build option preKeys): one reusable pre-key (an MLS KeyPackage) per device, public,
+ * replaced on rotation. Each one is signed by its device key and carries the root-signed device
+ * certificate, so readers check it against the owner's directory; the store itself is trusted
+ * for nothing but availability.
+ */
+export interface PreKeyStore {
+  /** Replace this device's pre-key. */
+  publish(deviceId: string, data: Bytes): Promise<void>;
+  /** Every pre-key `owner` has published, one per device, in no particular order. */
+  read(owner: Address): Promise<Bytes[]>;
+}
+
 // ---- Server-enforced (4, 11) ---------------------------------------------------------------
 
 /** Box 4 (build option). The owner uploads items; each is handed to exactly one taker. */
@@ -177,7 +190,7 @@ export interface ChannelAccess {
  * - `true-delete`: deleted items are gone from the channel (GitHub keeps git history).
  * - `owner-managed-spaces`: only the space creator can grant or revoke access.
  */
-export type Capability = 'claim-once' | 'inbox-payload' | 'true-delete' | 'owner-managed-spaces';
+export type Capability = 'claim-once' | 'inbox-payload' | 'true-delete' | 'owner-managed-spaces' | 'pre-keys';
 
 export interface ProviderLimits {
   maxBlobBytes: number;
@@ -191,6 +204,7 @@ export interface StorageProvider {
   readonly limits: ProviderLimits;
   readonly directory: PublicDirectory;
   readonly claimOnce?: ClaimOnceStore;
+  readonly preKeys?: PreKeyStore;
   readonly inviteInbox: InviteInbox;
   readonly orderedLog: OrderedLog;
   readonly mailbox: Mailbox;

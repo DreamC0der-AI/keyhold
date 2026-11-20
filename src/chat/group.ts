@@ -30,6 +30,7 @@ import {
   issueDeviceCertificate,
   verifyDeviceCertificate,
   type DeviceCertificate,
+  type DirectoryView,
   type IdentityRegistry,
   type RootKey,
 } from './identity.js';
@@ -154,6 +155,12 @@ interface GroupMeta {
   removed?: boolean;
   /** The channel refuses us (for example the owner revoked access after removing us). */
   accessLost?: boolean;
+  /** Our leaf came from a pre-key: commit a fresh one (cleared only by a commit of ours). */
+  freshLeaf?: boolean;
+  /** Epoch we joined at: older mail can't be ours to read, so it is skipped quietly. */
+  joinedEpoch?: string;
+  /** When this device first saw each device leaf that was added but hasn't joined (admins clean up). */
+  unjoinedSince?: Record<string, number>;
 }
 
 export interface RotationPolicy {
@@ -162,6 +169,37 @@ export interface RotationPolicy {
 }
 
 export const DEFAULT_ROTATION: RotationPolicy = { maxAgeMs: 7 * DAY, maxMessages: 100 };
+
+/**
+ * Pre-keys (build option preKeys). A device makes a new one on its first sync after `rotateMs`
+ * and keeps a retired private key until its first sync `keepMs` after retiring it, so a Welcome
+ * made just before a rotation still opens: invites expire after 7 days, and pruning runs only
+ * after that sync has opened what it can. Inviters skip pre-keys past `lifetimeMs`.
+ */
+export interface PreKeyPolicy {
+  rotateMs: number;
+  keepMs: number;
+  lifetimeMs: number;
+  /** Admins remove devices added with a pre-key that haven't joined after this long. */
+  joinDeadlineMs: number;
+}
+
+export const DEFAULT_PREKEYS: PreKeyPolicy = { rotateMs: 7 * DAY, keepMs: 7 * DAY, lifetimeMs: 30 * DAY, joinDeadlineMs: 14 * DAY };
+
+/**
+ * Leaf extension on pre-keys. A leaf that still has it (and was never replaced by a commit of
+ * its own) was added while offline and hasn't joined yet. Every member sees the same tree, so
+ * every member agrees who is only "added".
+ */
+export const PREKEY_EXTENSION = 0xf0a2;
+
+interface PreKeyInfo {
+  ref: string;
+  at: number;
+  pub: string;
+  retired: { ref: string; at: number }[];
+}
+const PREKEY_INFO = 'chat/prekey';
 
 export interface ChatOptions {
   provider: StorageProvider;
@@ -174,6 +212,8 @@ export interface ChatOptions {
   retainEpochs?: number;
   /** How old a cached directory may be before members' device lists are re-read. */
   directoryMaxAgeMs?: number;
+  /** Pre-key rotation (build option preKeys). */
+  preKeys?: PreKeyPolicy;
   /** Called with every decrypted message (for example, the history backup). */
   onMessage?: (group: Group, m: ReceivedMessage) => Promise<void> | void;
   now?: () => number;
@@ -184,6 +224,8 @@ export interface Member {
   address: Address;
   devices: { leafIndex: number; deviceId: string; device: string }[];
   admin: boolean;
+  /** Added with pre-keys while offline and hasn't joined yet (none of their devices has). */
+  pending: boolean;
 }
 
 export interface ReceivedMessage {
@@ -193,8 +235,11 @@ export interface ReceivedMessage {
 }
 
 export type GroupEvent =
+  /** Someone was added with pre-keys; they can read what is sent from now on once they join. */
+  | { type: 'added'; fingerprint: string; address: Address }
   | { type: 'joined'; fingerprint: string; address: Address }
-  | { type: 'left'; fingerprint: string; address: Address }
+  /** `pending`: they were added but never joined (declined, expired, or removed before joining). */
+  | { type: 'left'; fingerprint: string; address: Address; pending?: boolean }
   | { type: 'policy'; policy: GroupPolicy }
   | { type: 'rejected'; index: number; reason: string }
   | { type: 'undecryptable'; id: string; reason: string }
@@ -219,6 +264,12 @@ function leaves(state: mls.ClientState): MemberLeaf[] {
     out.push({ leafIndex: i / 2, root: fingerprint(unb64(cert.root)), device: cert.device, address: cert.address });
   });
   return out;
+}
+
+/** Added with a pre-key and never replaced by a commit of its own: this device hasn't joined. */
+function unjoinedLeaf(node: mls.NodeLeaf): boolean {
+  const leaf = node.leaf as mls.LeafNode;
+  return leaf.leafNodeSource === 'key_package' && leaf.extensions.some((e) => (e.extensionType as unknown) === PREKEY_EXTENSION);
 }
 
 function leafFromCredential(cred: mls.Credential, index = -1): MemberLeaf | undefined {
@@ -263,6 +314,7 @@ export class Chat {
   private constructor(opts: ChatOptions) {
     this.opts = {
       rotation: DEFAULT_ROTATION,
+      preKeys: DEFAULT_PREKEYS,
       retainEpochs: 4,
       directoryMaxAgeMs: 60 * 60 * 1000,
       now: Date.now,
@@ -331,10 +383,10 @@ export class Chat {
 
   capabilities(): mls.Capabilities {
     const caps = mls.defaultCapabilities();
-    return { ...caps, ciphersuites: [CIPHERSUITE], extensions: [...caps.extensions, POLICY_EXTENSION] };
+    return { ...caps, ciphersuites: [CIPHERSUITE], extensions: [...caps.extensions, POLICY_EXTENSION, PREKEY_EXTENSION] };
   }
 
-  async keyPackage(lifetimeMs = 30 * DAY) {
+  async keyPackage(lifetimeMs = 30 * DAY, preKey = false) {
     const cs = await ciphersuite();
     const id = this.identity;
     const now = BigInt(Math.floor(this.now() / 1000));
@@ -345,6 +397,7 @@ export class Chat {
       [],
       { signKey: id.signKey, publicKey: id.publicKey },
       cs,
+      preKey ? [{ extensionType: PREKEY_EXTENSION, extensionData: new Uint8Array() } as never] : [],
     );
   }
 
@@ -436,7 +489,8 @@ export class Chat {
       if (msg.wireformat !== 'mls_welcome') continue;
       const g = await this.joinWithWelcome(space, msg.welcome);
       if (g) {
-        await p.dropBox.delete(space, tag, d.id);
+        // One Welcome can carry secrets for several of this person's devices: leave it for the others.
+        if (msg.welcome.secrets.length === 1) await p.dropBox.delete(space, tag, d.id);
         return g;
       }
     }
@@ -452,7 +506,10 @@ export class Chat {
       const groupId = gi.groupContext.groupId;
       const policy = decodePolicy(gi.groupContext.extensions as never);
       const treeLeaves = leavesOfGroupInfo(gi);
-      const selfJoin = treeLeaves.some((l) => l.root === this.identity.fingerprint);
+      // Another device of ours is in: join as one more device. A leaf of this very device (added
+      // with a pre-key we can't open) doesn't count: it is replaced, so we need a ticket.
+      const myDevice = b64(this.identity.publicKey);
+      const selfJoin = treeLeaves.some((l) => l.root === this.identity.fingerprint && l.device !== myDevice);
 
       let ticketBytes: Uint8Array = new Uint8Array();
       let ticketDropId: string | undefined;
@@ -466,7 +523,10 @@ export class Chat {
         ticketDropId = found.dropId;
       }
       const kp = await this.keyPackage();
-      const { publicMessage, newState } = await mls.joinGroupExternal(gi, kp.publicPackage, kp.privatePackage, false, cs, undefined, this.clientConfig(), ticketBytes);
+      // A leaf of this very device already there (added with a pre-key whose Welcome we couldn't
+      // open): replace it, so no leaf stays on the reusable key.
+      const resync = treeLeaves.some((l) => l.device === myDevice);
+      const { publicMessage, newState } = await mls.joinGroupExternal(gi, kp.publicPackage, kp.privatePackage, resync, cs, undefined, this.clientConfig(), ticketBytes);
       const index = raw.length;
       const entry: LogEntry = {
         v: 1,
@@ -528,7 +588,8 @@ export class Chat {
     const eph = this.opts.device.ephemeral;
     for (const s of welcome.secrets) {
       const ref = b64(s.newMember);
-      const key = (await eph.get(`chat/kp/${ref}`)) ? `chat/kp/${ref}` : (await eph.get(`chat/kplr/${ref}`)) ? `chat/kplr/${ref}` : undefined;
+      let key: string | undefined;
+      for (const prefix of ['chat/kp/', 'chat/pk/', 'chat/kplr/']) if (!key && (await eph.get(`${prefix}${ref}`))) key = `${prefix}${ref}`;
       if (!key) continue;
       const stored = parseJsonBytes<{ pub: string; priv: Record<string, string> }>((await eph.get(key))!);
       const pubMsg = decodeMsg(unb64(stored.pub));
@@ -547,8 +608,12 @@ export class Chat {
       if (at === undefined) throw new KeyholdError('bad_format', 'the commit that added us is not in the log');
       const meta = this.newMeta(b64(state.groupContext.groupId), space, at + 1, scan.hashes[at]!);
       meta.hashes = scan.hashes.slice(0, at + 1);
-      meta.usedNonces = [...scan.usedNonces];
-      meta.mailCursor = undefined; // messages after the add are readable; older ones fail quietly
+      // Only tickets burned up to the add: later entries are replayed and burn their own.
+      meta.usedNonces = [...(await scanLog(raw.slice(0, at + 1))).usedNonces];
+      meta.mailCursor = undefined; // messages after the add are readable; older ones are skipped
+      meta.joinedEpoch = String(state.groupContext.epoch);
+      // Our leaf still holds the reusable pre-key: replace it with a fresh key on the next sync.
+      meta.freshLeaf = true;
       const g = new Group(this, meta, state);
       await g.persist();
       this.groups.set(meta.groupId, g);
@@ -577,15 +642,97 @@ export class Chat {
     return this.storeKeyPackage('chat/kplr/', lifetimeMs);
   }
 
+  // ---- Pre-keys (box 3b, build option) ----
+
+  /**
+   * Keep this device's pre-key published and fresh, and prune retired ones. Call it after
+   * joining what can be joined, so a retired key is never pruned before its Welcome was tried.
+   * Publishes when there is none yet (also for accounts made before pre-keys existed), when the
+   * published one went missing, or when it is due for rotation. Returns true if it published.
+   */
+  async refreshPreKey(): Promise<boolean> {
+    if (!this.opts.features.preKeys) return false;
+    const pol = this.opts.preKeys;
+    const now = this.now();
+    const eph = this.opts.device.ephemeral;
+    const ks = this.opts.device.keystore;
+    const raw = await ks.get(PREKEY_INFO);
+    let info = raw ? parseJsonBytes<PreKeyInfo>(raw) : undefined;
+    let due = !info || !(await eph.get(`chat/pk/${info.ref}`)) || now - info.at >= pol.rotateMs;
+    if (!due && !this.preKeyChecked) {
+      // Once per start: is it still there? (The public repo may have been reset.)
+      const mine = await this.provider.preKeys!.read(this.identity.address);
+      due = !mine.some((b) => b64(b) === info!.pub);
+    }
+    this.preKeyChecked = true;
+    let published = false;
+    if (due) {
+      const { ref, pub } = await this.makeKeyPackage('chat/pk/', pol.lifetimeMs, pol.lifetimeMs + 14 * DAY, true);
+      await this.provider.preKeys!.publish(this.identity.deviceId, pub);
+      const retired = [...(info?.retired ?? [])];
+      if (info && info.ref !== ref) retired.push({ ref: info.ref, at: now });
+      info = { ref, at: now, pub: b64(pub), retired };
+      published = true;
+    }
+    const keep: PreKeyInfo['retired'] = [];
+    for (const r of info!.retired) {
+      if (now - r.at >= pol.keepMs) await eph.delete(`chat/pk/${r.ref}`);
+      else keep.push(r);
+    }
+    info!.retired = keep;
+    await ks.put(PREKEY_INFO, jsonBytes(info));
+    return published;
+  }
+
+  private preKeyChecked = false;
+
+  /** Valid pre-keys of a person: one per current device, signed by it, certified by their root, not expired. */
+  async preKeysOf(view: DirectoryView): Promise<mls.KeyPackage[]> {
+    if (!this.opts.features.preKeys) return [];
+    const nowS = BigInt(Math.floor(this.now() / 1000));
+    const byDevice = new Map<string, mls.KeyPackage>();
+    let items: Bytes[] = [];
+    try {
+      items = await this.provider.preKeys!.read(view.address);
+    } catch {
+      return [];
+    }
+    for (const b of items) {
+      let msg: mls.MLSMessage;
+      try {
+        msg = decodeMsg(b);
+      } catch {
+        continue;
+      }
+      if (msg.wireformat !== 'mls_key_package') continue;
+      const kp = msg.keyPackage;
+      const leaf = kp.leafNode as mls.LeafNode & { lifetime?: { notBefore: bigint; notAfter: bigint } };
+      const cert = certificateFromCredential(leaf.credential as never);
+      if (!cert || !verifyDeviceCertificate(cert) || cert.address !== view.address) continue;
+      if (fingerprint(unb64(cert.root)) !== view.fingerprint || !view.devices.has(cert.device)) continue;
+      if (cert.device !== b64(leaf.signaturePublicKey)) continue;
+      if (!leaf.extensions.some((e) => (e.extensionType as unknown) === PREKEY_EXTENSION)) continue;
+      // An hour of slack for clocks; the device only keeps it a while past lifetime.
+      if (!leaf.lifetime || leaf.lifetime.notAfter <= nowS + 3600n || leaf.lifetime.notBefore > nowS + 3600n) continue;
+      const prev = byDevice.get(cert.device) as (mls.KeyPackage & { leafNode: { lifetime?: { notBefore: bigint } } }) | undefined;
+      if (!prev || (prev.leafNode.lifetime?.notBefore ?? 0n) < leaf.lifetime.notBefore) byDevice.set(cert.device, kp);
+    }
+    return [...byDevice.values()];
+  }
+
   private async storeKeyPackage(prefix: string, lifetimeMs: number): Promise<Bytes> {
+    return (await this.makeKeyPackage(prefix, lifetimeMs, lifetimeMs)).pub;
+  }
+
+  private async makeKeyPackage(prefix: string, lifetimeMs: number, keepMs: number, preKey = false): Promise<{ ref: string; pub: Bytes }> {
     const cs = await ciphersuite();
-    const kp = await this.keyPackage(lifetimeMs);
+    const kp = await this.keyPackage(lifetimeMs, preKey);
     const ref = b64(await makeKeyPackageRef(kp.publicPackage, cs.hash));
     const pub = encodeMsg({ wireformat: 'mls_key_package', version: 'mls10', keyPackage: kp.publicPackage });
     // The signature key is the device key (box 1): it is not copied into box 2.
     const priv = { init: b64(kp.privatePackage.initPrivateKey), hpke: b64(kp.privatePackage.hpkePrivateKey) };
-    await this.opts.device.ephemeral.put(`${prefix}${ref}`, jsonBytes({ pub: b64(pub), priv }), { expiresAt: this.now() + lifetimeMs });
-    return pub;
+    await this.opts.device.ephemeral.put(`${prefix}${ref}`, jsonBytes({ pub: b64(pub), priv }), { expiresAt: this.now() + keepMs });
+    return { ref, pub };
   }
 
   /** Members check tickets without a clock (see verifyTicket). */
@@ -722,8 +869,9 @@ export class Group {
     for (const l of leaves(this.state)) {
       const node = this.state.ratchetTree[l.leafIndex * 2] as mls.NodeLeaf;
       const cert = certificateFromCredential(node.leaf.credential as never)!;
-      const m = by.get(l.root) ?? { fingerprint: l.root, address: l.address, devices: [], admin: policy.admins.includes(l.root) };
+      const m: Member = by.get(l.root) ?? { fingerprint: l.root, address: l.address, devices: [], admin: policy.admins.includes(l.root), pending: true };
       m.devices.push({ leafIndex: l.leafIndex, deviceId: cert.deviceId, device: l.device });
+      if (!unjoinedLeaf(node) || l.leafIndex === this.myLeaf) m.pending = false;
       by.set(l.root, m);
     }
     return [...by.values()];
@@ -869,10 +1017,34 @@ export class Group {
     const look = await this.chat.opts.registry.lookup(address);
     if (look.status === 'key-changed') throw new KeyholdError('key_changed', `${address} has a new identity key; confirm it first`);
     if (look.status === 'none' && options.requireIdentity) throw new KeyholdError('not_found', `${address} has no identity yet`);
+    // With pre-keys, add every device of theirs that has one now, so the group can write to
+    // them before they accept. The ticket still goes out: it lets a device that has no usable
+    // pre-key (or whose Welcome can't be opened) join when they accept.
+    if (look.status === 'ok') await this.addWithPreKeys(look.view);
     const ticket = await this.issueTicket(address, look.status === 'ok' ? look.view.fingerprint : undefined, this.chat.now() + (options.ttlMs ?? 7 * DAY));
     if (!ticket.toRoot) this.meta.awaitingUpgradeUntil = Math.max(this.meta.awaitingUpgradeUntil ?? 0, ticket.expiresAt);
     await this.grantChannel(address, ticket.expiresAt);
     return ticket;
+  }
+
+  private async addWithPreKeys(view: DirectoryView) {
+    const kps = await this.chat.preKeysOf(view);
+    if (!kps.length) return;
+    const fresh = () => {
+      const inTree = new Set(leaves(this.state).map((l) => l.device));
+      return kps.filter((kp) => !inTree.has(b64(kp.leafNode.signaturePublicKey)));
+    };
+    if (!fresh().length) return;
+    let res: mls.CreateCommitResult | undefined;
+    try {
+      res = await this.commit(() => fresh().map((kp) => ({ proposalType: 'add', add: { keyPackage: kp } }) as mls.Proposal), () => fresh().length > 0);
+    } catch (err) {
+      // A broken or stale pre-key must not block the invite: the ticket still works.
+      if ((err as KeyholdError).code === 'conflict' || (err as KeyholdError).code === 'policy_rejected') throw err;
+      return;
+    }
+    if (!res?.welcome) return;
+    await this.chat.provider.dropBox.put(this.meta.space, await recipientTag(view.address), encodeMsg({ wireformat: 'mls_welcome', version: 'mls10', welcome: res.welcome }));
   }
 
   /**
@@ -1136,6 +1308,8 @@ export class Group {
         this.meta.sentSinceUpdate = 0;
         this.meta.lastUpdateAt = this.chat.now();
         this.meta.needsHeal = false;
+        // An add-only commit carries no new key for our leaf.
+        if (this.meta.freshLeaf) this.meta.freshLeaf = unjoinedLeaf(this.state.ratchetTree[this.myLeaf * 2] as mls.NodeLeaf);
         await this.persist();
         await dev.ephemeral.delete(pendingKey);
         return res;
@@ -1216,6 +1390,8 @@ export class Group {
         out.events.push({ type: 'undecryptable', id: item.id, reason: 'not an MLS message' });
         continue;
       }
+      // Written before we were in the group: not for us, and nothing to report.
+      if (this.meta.joinedEpoch !== undefined && BigInt(epoch) < BigInt(this.meta.joinedEpoch)) continue;
       this.meta.pending.push({ id: item.id, data: b64(item.data), epoch });
     }
     this.meta.mailCursor = mail.cursor;
@@ -1422,8 +1598,15 @@ export class Group {
 
   private diffMembers(before: Member[], out: SyncResult) {
     const after = this.members();
-    for (const m of after) if (!before.some((b) => b.fingerprint === m.fingerprint)) out.events.push({ type: 'joined', fingerprint: m.fingerprint, address: m.address });
-    for (const b of before) if (!after.some((m) => m.fingerprint === b.fingerprint)) out.events.push({ type: 'left', fingerprint: b.fingerprint, address: b.address });
+    for (const m of after) {
+      const b = before.find((x) => x.fingerprint === m.fingerprint);
+      if (!b) out.events.push({ type: m.pending ? 'added' : 'joined', fingerprint: m.fingerprint, address: m.address });
+      else if (b.pending && !m.pending) out.events.push({ type: 'joined', fingerprint: m.fingerprint, address: m.address });
+    }
+    for (const b of before) {
+      if (after.some((m) => m.fingerprint === b.fingerprint)) continue;
+      out.events.push(b.pending ? { type: 'left', fingerprint: b.fingerprint, address: b.address, pending: true } : { type: 'left', fingerprint: b.fingerprint, address: b.address });
+    }
   }
 
   /** Housekeeping after a sync: heal forks, commit pending removes, drop revoked devices, rotate, fix channel access. */
@@ -1446,11 +1629,11 @@ export class Group {
     const mayActOn = (l: MemberLeaf) => this.policy.admins.includes(me) || l.root === me;
     const revokedNow = () => leaves(this.state).filter((l) => l.leafIndex !== this.myLeaf && registry.isRevoked(l.device, l.address) && mayActOn(l));
     const pendingProposals = Object.keys(this.state.unappliedProposals).length > 0;
-    if (revokedNow().length || pendingProposals || this.meta.needsHeal) {
+    if (revokedNow().length || pendingProposals || this.meta.needsHeal || this.meta.freshLeaf) {
       try {
         const revoked = revokedNow();
         if (revoked.length) await this.banAndRemove(revoked.map((l) => ({ device: l.device, root: l.root })));
-        await this.commit([], () => this.meta.needsHeal || Object.keys(this.state.unappliedProposals).length > 0);
+        await this.commit([], () => this.meta.needsHeal || !!this.meta.freshLeaf || Object.keys(this.state.unappliedProposals).length > 0);
         out.events.push({ type: 'rotated', epoch: this.epoch });
       } catch (err) {
         if ((err as KeyholdError).code !== 'policy_rejected') throw err;
@@ -1459,6 +1642,7 @@ export class Group {
       await this.commit([]);
       out.events.push({ type: 'rotated', epoch: this.epoch });
     }
+    await this.removeUnjoined();
     // Only admins issue tickets, so only they answer join requests: on every sync while this
     // device has an address-only invite out, else every 10 minutes (for invites from my other devices).
     const now = this.chat.now();
@@ -1480,6 +1664,29 @@ export class Group {
     return this.exclusive(() => this.reconcileNow(force));
   }
 
+  /**
+   * Devices added with pre-keys that never joined: removed by an admin after the join deadline,
+   * or earlier when `gone` says they no longer can (their channel invitation ended).
+   */
+  private async removeUnjoined(gone?: (l: MemberLeaf) => boolean) {
+    const now = this.chat.now();
+    const since = (this.meta.unjoinedSince ??= {});
+    const unjoined = () => leaves(this.state).filter((l) => l.leafIndex !== this.myLeaf && unjoinedLeaf(this.state.ratchetTree[l.leafIndex * 2] as mls.NodeLeaf));
+    const current = unjoined();
+    for (const k of Object.keys(since)) if (!current.some((l) => l.device === k)) delete since[k];
+    for (const l of current) since[l.device] ??= now;
+    if (!this.policy.admins.includes(this.chat.identity.fingerprint)) return;
+    const deadline = this.chat.opts.preKeys.joinDeadlineMs;
+    // A grace period for the channel check: the invitation is made right after the add.
+    const due = () => unjoined().filter((l) => now - (since[l.device] ?? now) >= deadline || (gone?.(l) && now - (since[l.device] ?? now) >= 10 * 60_000));
+    if (!due().length) return;
+    try {
+      await this.commit(() => due().map((l) => ({ proposalType: 'remove', remove: { removed: l.leafIndex } }) as mls.Proposal), () => due().length > 0);
+    } catch (err) {
+      if ((err as KeyholdError).code !== 'policy_rejected') throw err;
+    }
+  }
+
   private async reconcileNow(force = false): Promise<{ revoked: Address[] }> {
     const ch = this.chat.provider.channel;
     if (!this.active || !(await ch.canManage(this.meta.space))) return { revoked: [] };
@@ -1489,6 +1696,10 @@ export class Group {
     this.lastMembership = sig;
     this.meta.lastReconcile = now;
     const { active, pending } = await ch.members(this.meta.space);
+    // Added with pre-keys, but their channel invitation is gone (declined or expired): they can
+    // never join, so take them out of the group too.
+    const invited = new Set<Address>([...active, ...pending]);
+    await this.removeUnjoined((l) => !invited.has(l.address));
     const candidates: Address[] = [];
     const keep0 = new Set<Address>([ch.self, ...leaves(this.state).map((l) => l.address)]);
     for (const a of new Set([...active, ...pending])) if (!keep0.has(a) && !(await this.findTicket(a))) candidates.push(a);

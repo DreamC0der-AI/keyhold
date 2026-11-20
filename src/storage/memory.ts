@@ -42,6 +42,8 @@ interface Space {
 export interface MemoryWorldOptions {
   /** Provide box 4 (claim-once). Default true. */
   claimOnce?: boolean;
+  /** Provide pre-keys (box 3b). Default true. */
+  preKeys?: boolean;
   /** Only the creator may grant or revoke (like GitHub personal repos). Default false. */
   ownerManagedSpaces?: boolean;
   /** Max invite notices one sender may send per day. */
@@ -53,6 +55,7 @@ export class MemoryWorld {
   readonly options: Required<Omit<MemoryWorldOptions, 'now'>>;
   readonly now: () => number;
   readonly directories = new Map<Address, Bytes[]>();
+  readonly preKeys = new Map<Address, Map<string, Bytes>>();
   readonly claims = new Map<Address, { data: Bytes; expiresAt: number }[]>();
   readonly inboxes = new Map<Address, ReceivedNotice[]>();
   readonly sent = new Map<Address, number[]>();
@@ -65,6 +68,7 @@ export class MemoryWorld {
   constructor(options: MemoryWorldOptions = {}) {
     this.options = {
       claimOnce: options.claimOnce ?? true,
+      preKeys: options.preKeys ?? true,
       ownerManagedSpaces: options.ownerManagedSpaces ?? false,
       inboxRateLimit: options.inboxRateLimit ?? 50,
     };
@@ -92,6 +96,7 @@ export class MemoryWorld {
 function memorySession(w: MemoryWorld, self: Address): StorageProvider {
   const caps = new Set<Capability>(['inbox-payload', 'true-delete']);
   if (w.options.claimOnce) caps.add('claim-once');
+  if (w.options.preKeys) caps.add('pre-keys');
   if (w.options.ownerManagedSpaces) caps.add('owner-managed-spaces');
 
   const space = (ref: SpaceRef): Space => {
@@ -173,6 +178,17 @@ function memorySession(w: MemoryWorld, self: Address): StorageProvider {
         return 'ok';
       },
     },
+    preKeys: w.options.preKeys
+      ? {
+          async publish(deviceId, data) {
+            mine(w.preKeys, () => new Map<string, Bytes>()).set(deviceId, copy(data));
+          },
+          async read(owner) {
+            w.count('preKeys.read');
+            return [...(w.preKeys.get(owner)?.values() ?? [])].map(copy);
+          },
+        }
+      : undefined,
     claimOnce: w.options.claimOnce
       ? {
           async publish(items, options) {
