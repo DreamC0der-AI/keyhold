@@ -75,6 +75,24 @@ describe('pre-keys (build option preKeys)', () => {
     expect(texts(await g.sync())).toEqual(['hi all']);
   });
 
+  it('the joiner replaces its pre-key leaf even when other commits came first', async () => {
+    const { w, opts } = setup();
+    const bob = await makeUser(w.session('mem:bob'), 'mem:bob', opts);
+    const carol = await makeUser(w.session('mem:carol'), 'mem:carol', opts);
+    const dave = await makeUser(w.session('mem:dave'), 'mem:dave', opts);
+    await carol.chat.refreshPreKey();
+    await dave.chat.refreshPreKey();
+    const g = await bob.chat.createGroup('group');
+    await g.invite(carol.address);
+    await g.invite(dave.address); // a commit after carol's add
+    await g.rotate();
+    const [gc] = await carol.chat.acceptInvites();
+    await gc!.sync();
+    const r = await g.sync();
+    expect(r.events).toContainEqual({ type: 'joined', fingerprint: carol.identity.fingerprint, address: 'mem:carol' });
+    expect(pendingOf(g)).toEqual(['mem:dave']);
+  });
+
   it('a DM with pre-keys: both write at once', async () => {
     const { w, opts } = setup();
     const bob = await makeUser(w.session('mem:bob'), 'mem:bob', opts);

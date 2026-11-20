@@ -155,6 +155,8 @@ interface GroupMeta {
   removed?: boolean;
   /** The channel refuses us (for example the owner revoked access after removing us). */
   accessLost?: boolean;
+  /** Our leaf came from a pre-key: commit a fresh one (cleared only by a commit of ours). */
+  freshLeaf?: boolean;
   /** Epoch we joined at: older mail can't be ours to read, so it is skipped quietly. */
   joinedEpoch?: string;
   /** When this device first saw each device leaf that was added but hasn't joined (admins clean up). */
@@ -611,7 +613,7 @@ export class Chat {
       meta.mailCursor = undefined; // messages after the add are readable; older ones are skipped
       meta.joinedEpoch = String(state.groupContext.epoch);
       // Our leaf still holds the reusable pre-key: replace it with a fresh key on the next sync.
-      meta.needsHeal = true;
+      meta.freshLeaf = true;
       const g = new Group(this, meta, state);
       await g.persist();
       this.groups.set(meta.groupId, g);
@@ -1306,6 +1308,8 @@ export class Group {
         this.meta.sentSinceUpdate = 0;
         this.meta.lastUpdateAt = this.chat.now();
         this.meta.needsHeal = false;
+        // An add-only commit carries no new key for our leaf.
+        if (this.meta.freshLeaf) this.meta.freshLeaf = unjoinedLeaf(this.state.ratchetTree[this.myLeaf * 2] as mls.NodeLeaf);
         await this.persist();
         await dev.ephemeral.delete(pendingKey);
         return res;
@@ -1625,11 +1629,11 @@ export class Group {
     const mayActOn = (l: MemberLeaf) => this.policy.admins.includes(me) || l.root === me;
     const revokedNow = () => leaves(this.state).filter((l) => l.leafIndex !== this.myLeaf && registry.isRevoked(l.device, l.address) && mayActOn(l));
     const pendingProposals = Object.keys(this.state.unappliedProposals).length > 0;
-    if (revokedNow().length || pendingProposals || this.meta.needsHeal) {
+    if (revokedNow().length || pendingProposals || this.meta.needsHeal || this.meta.freshLeaf) {
       try {
         const revoked = revokedNow();
         if (revoked.length) await this.banAndRemove(revoked.map((l) => ({ device: l.device, root: l.root })));
-        await this.commit([], () => this.meta.needsHeal || Object.keys(this.state.unappliedProposals).length > 0);
+        await this.commit([], () => this.meta.needsHeal || !!this.meta.freshLeaf || Object.keys(this.state.unappliedProposals).length > 0);
         out.events.push({ type: 'rotated', epoch: this.epoch });
       } catch (err) {
         if ((err as KeyholdError).code !== 'policy_rejected') throw err;
