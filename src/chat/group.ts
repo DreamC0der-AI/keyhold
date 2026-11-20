@@ -547,7 +547,8 @@ export class Chat {
       if (at === undefined) throw new KeyholdError('bad_format', 'the commit that added us is not in the log');
       const meta = this.newMeta(b64(state.groupContext.groupId), space, at + 1, scan.hashes[at]!);
       meta.hashes = scan.hashes.slice(0, at + 1);
-      meta.usedNonces = [...scan.usedNonces];
+      // Only tickets burned up to the add: later entries are replayed and burn their own.
+      meta.usedNonces = [...(await scanLog(raw.slice(0, at + 1))).usedNonces];
       meta.mailCursor = undefined; // messages after the add are readable; older ones fail quietly
       const g = new Group(this, meta, state);
       await g.persist();
