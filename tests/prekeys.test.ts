@@ -93,6 +93,30 @@ describe('pre-keys (build option preKeys)', () => {
     expect(pendingOf(g)).toEqual(['mem:dave']);
   });
 
+  it('two joins of one space at once give one group, so the device never forks off', async () => {
+    const { w, opts } = setup();
+    const bob = await makeUser(w.session('mem:bob'), 'mem:bob', opts);
+    const carol = await makeUser(w.session('mem:carol'), 'mem:carol', opts);
+    await carol.chat.refreshPreKey();
+    const g = await bob.chat.createGroup('group');
+    await g.invite(carol.address);
+    await g.send({ t: 'text', body: 'hi' });
+    for (const n of await w.session('mem:carol').inviteInbox.list()) await w.session('mem:carol').channel.acceptGrant(n.pointer);
+    // E.g. the app's Accept and its regular check both reach join() before either finishes.
+    const [a, b] = await Promise.all([carol.chat.join(g.space), carol.chat.join(g.space)]);
+    expect(a).toBe(b);
+    expect(await carol.chat.join(g.space)).toBe(a); // already joined: the same group again
+    expect(texts(await a!.sync())).toEqual(['hi']);
+    const r = await g.sync();
+    expect(types(r.events)).not.toContain('rejected');
+    await a!.send({ t: 'text', body: 'from carol' });
+    expect(texts(await g.sync())).toEqual(['from carol']);
+    await g.send({ t: 'text', body: 'from bob' });
+    const back = await a!.sync();
+    expect(texts(back)).toEqual(['from bob']);
+    expect(types(back.events)).not.toContain('rejected');
+  });
+
   it('a DM with pre-keys: both write at once', async () => {
     const { w, opts } = setup();
     const bob = await makeUser(w.session('mem:bob'), 'mem:bob', opts);
