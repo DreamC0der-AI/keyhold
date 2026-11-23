@@ -206,4 +206,29 @@ describe('pre-keys (build option preKeys)', () => {
     const joined = await carol.chat.acceptInvites();
     expect(joined.map((x) => x.id)).toEqual([g2.id]); // by ticket
   });
+
+  it('an invite note is sealed to the invitee\'s pre-keys: each device opens it, nobody else can', async () => {
+    const { w, opts } = setup();
+    const bob = await makeUser(w.session('mem:bob'), 'mem:bob', opts);
+    const carol = await makeUser(w.session('mem:carol'), 'mem:carol', opts);
+    const phone = await addDevice(carol, opts);
+    const dave = await makeUser(w.session('mem:dave'), 'mem:dave', opts);
+    for (const u of [carol, phone, dave]) await u.chat.refreshPreKey();
+    const g = await bob.chat.createGroup('group', 'team');
+    const note = new TextEncoder().encode('{"kind":"group","name":"team"}');
+    await g.invite(carol.address, { note });
+    const [n] = await w.session('mem:carol').inviteInbox.list();
+    expect(n!.payload).toBeDefined();
+    expect(new TextDecoder().decode(n!.payload!)).not.toContain('team'); // sealed
+    expect(await carol.chat.openInviteNote(n!)).toEqual(note);
+    expect(await phone.chat.openInviteNote(n!)).toEqual(note);
+    expect(await dave.chat.openInviteNote(n!)).toBeUndefined();
+    // Bound to the inviter: the same note under another sender doesn't open.
+    expect(await carol.chat.openInviteNote({ ...n!, from: 'mem:dave' })).toBeUndefined();
+    // No pre-key, no note; the invite still works.
+    const erin = await makeUser(w.session('mem:erin'), 'mem:erin', opts);
+    await g.invite(erin.address, { note });
+    const [e] = await w.session('mem:erin').inviteInbox.list();
+    expect(e!.payload).toBeUndefined();
+  });
 });

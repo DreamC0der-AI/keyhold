@@ -686,6 +686,36 @@ export class Chat {
 
   private preKeyChecked = false;
 
+  /**
+   * Open the note an inviter sealed to this device's pre-key (see `InviteOptions.note`). Undefined
+   * when there is none, it was sealed to other devices, or the pre-key is gone. The inviter's
+   * address is bound in, so a note can't be moved to another person's invitation; what it says is
+   * still only the inviter's word until the chat is joined.
+   */
+  async openInviteNote(notice: { from: Address; payload?: Bytes }): Promise<Bytes | undefined> {
+    if (!notice.payload) return undefined;
+    let sealed: SealedNote;
+    try {
+      sealed = parseJsonBytes<SealedNote>(notice.payload);
+    } catch {
+      return undefined;
+    }
+    if (sealed?.v !== 1 || !Array.isArray(sealed.to)) return undefined;
+    const cs = await ciphersuite();
+    for (const t of sealed.to) {
+      const raw = await this.opts.device.ephemeral.get(`chat/pk/${t.ref}`);
+      if (!raw) continue;
+      try {
+        const { priv } = parseJsonBytes<{ priv: { init: string } }>(raw);
+        const key = await cs.hpke.importPrivateKey(unb64(priv.init));
+        return await cs.hpke.open(key, unb64(t.enc), unb64(t.ct), utf8(NOTE_INFO), utf8(notice.from));
+      } catch {
+        continue;
+      }
+    }
+    return undefined;
+  }
+
   /** Valid pre-keys of a person: one per current device, signed by it, certified by their root, not expired. */
   async preKeysOf(view: DirectoryView): Promise<mls.KeyPackage[]> {
     if (!this.opts.features.preKeys) return [];
@@ -740,6 +770,38 @@ export class Chat {
     const cs = await ciphersuite();
     return verifyTicket(t, groupId, undefined, (pk, m, s) => cs.signature.verify(pk, m, s));
   }
+}
+
+export interface InviteOptions {
+  /** Only accept people who already have an identity. */
+  requireIdentity?: boolean;
+  ttlMs?: number;
+  /**
+   * A short note for the invitee to read before accepting (e.g. what kind of chat it is). It is
+   * sealed to each of their devices' pre-keys and rides in the invite notice, so it needs the
+   * `inbox-payload` capability and a published pre-key; otherwise it is left out.
+   */
+  note?: Bytes;
+}
+
+const NOTE_INFO = 'keyhold/invite-note/v1';
+const NOTE_MAX = 2048;
+
+interface SealedNote {
+  v: 1;
+  to: { ref: string; enc: string; ct: string }[];
+}
+
+async function sealInviteNote(note: Bytes, kps: mls.KeyPackage[], from: Address): Promise<Bytes | undefined> {
+  if (note.length > NOTE_MAX) throw new KeyholdError('config', `invite note is over ${NOTE_MAX} bytes`);
+  const cs = await ciphersuite();
+  const to: SealedNote['to'] = [];
+  for (const kp of kps) {
+    const ref = b64(await makeKeyPackageRef(kp, cs.hash));
+    const { enc, ct } = await cs.hpke.seal(await cs.hpke.importPublicKey(kp.initKey), note, utf8(NOTE_INFO), utf8(from));
+    to.push({ ref, enc: b64(enc), ct: b64(ct) });
+  }
+  return to.length ? jsonBytes({ v: 1, to } satisfies SealedNote) : undefined;
 }
 
 interface JoinRequest {
@@ -1000,11 +1062,11 @@ export class Group {
    * Invite someone: write an admin-signed ticket to their drop box (box 8), give them channel
    * access and drop a notice in their inbox (box 11). They join when they accept.
    */
-  invite(address: Address, options: { requireIdentity?: boolean; ttlMs?: number } = {}): Promise<InviteTicket> {
+  invite(address: Address, options: InviteOptions = {}): Promise<InviteTicket> {
     return this.exclusive(() => this.inviteNow(address, options));
   }
 
-  private async inviteNow(address: Address, options: { requireIdentity?: boolean; ttlMs?: number }): Promise<InviteTicket> {
+  private async inviteNow(address: Address, options: InviteOptions): Promise<InviteTicket> {
     this.requireActive();
     await this.pull();
     const me = this.chat.identity;
@@ -1020,16 +1082,16 @@ export class Group {
     // With pre-keys, add every device of theirs that has one now, so the group can write to
     // them before they accept. The ticket still goes out: it lets a device that has no usable
     // pre-key (or whose Welcome can't be opened) join when they accept.
-    if (look.status === 'ok') await this.addWithPreKeys(look.view);
+    const kps = look.status === 'ok' ? await this.chat.preKeysOf(look.view) : [];
+    if (look.status === 'ok' && kps.length) await this.addWithPreKeys(look.view, kps);
     const ticket = await this.issueTicket(address, look.status === 'ok' ? look.view.fingerprint : undefined, this.chat.now() + (options.ttlMs ?? 7 * DAY));
     if (!ticket.toRoot) this.meta.awaitingUpgradeUntil = Math.max(this.meta.awaitingUpgradeUntil ?? 0, ticket.expiresAt);
-    await this.grantChannel(address, ticket.expiresAt);
+    const payload = options.note && kps.length && this.chat.opts.features.inboxPayload ? await sealInviteNote(options.note, kps, this.chat.identity.address) : undefined;
+    await this.grantChannel(address, ticket.expiresAt, payload);
     return ticket;
   }
 
-  private async addWithPreKeys(view: DirectoryView) {
-    const kps = await this.chat.preKeysOf(view);
-    if (!kps.length) return;
+  private async addWithPreKeys(view: DirectoryView, kps: mls.KeyPackage[]) {
     const fresh = () => {
       const inTree = new Set(leaves(this.state).map((l) => l.device));
       return kps.filter((kp) => !inTree.has(b64(kp.leafNode.signaturePublicKey)));
@@ -1104,11 +1166,11 @@ export class Group {
     return undefined;
   }
 
-  private async grantChannel(address: Address, expiresAt: number) {
+  private async grantChannel(address: Address, expiresAt: number, payload?: Bytes) {
     const p = this.chat.provider;
     const r = await p.channel.grant(this.meta.space, address);
     if (r.status === 'invited') {
-      await p.inviteInbox.send(address, { pointer: r.pointer });
+      await p.inviteInbox.send(address, payload ? { pointer: r.pointer, payload } : { pointer: r.pointer });
     } else if (r.status === 'needs-manager') {
       // Only the space owner can let people in on this channel: ask their app (it checks we are an admin).
       await this.sendNow([{ t: 'sys.grant', address, expiresAt }]);
