@@ -309,6 +309,8 @@ function summarize(p: mls.ProposalWithSender): ProposalSummary {
 /** One device's view of all its chats. */
 export class Chat {
   readonly groups = new Map<string, Group>();
+  /** Joins in flight, by space: a second join of the same space waits for the first. */
+  private joining = new Map<SpaceRef, Promise<Group | undefined>>();
   readonly opts: Required<Omit<ChatOptions, 'onMessage'>> & Pick<ChatOptions, 'onMessage'>;
 
   private constructor(opts: ChatOptions) {
@@ -472,7 +474,27 @@ export class Chat {
    * Join one space: with a Welcome (offline add), as another device of a member (self-join),
    * or with a valid ticket for this address. Returns undefined when nothing lets us in.
    */
-  async join(space: SpaceRef): Promise<Group | undefined> {
+  join(space: SpaceRef): Promise<Group | undefined> {
+    // Two joins of one space must never both succeed: each would hold its own copy of the group
+    // state, both would commit, and each copy rejects the other's commits, so the device forks off
+    // the group. A join that overlaps one in flight shares its result; a space already joined
+    // returns the group we have.
+    const have = this.groupInSpace(space);
+    if (have) return Promise.resolve(have);
+    let run = this.joining.get(space);
+    if (!run) {
+      run = this.joinNow(space).finally(() => this.joining.delete(space));
+      this.joining.set(space, run);
+    }
+    return run;
+  }
+
+  private groupInSpace(space: SpaceRef): Group | undefined {
+    for (const g of this.groups.values()) if (g.space === space && g.active) return g;
+    return undefined;
+  }
+
+  private async joinNow(space: SpaceRef): Promise<Group | undefined> {
     const p = this.provider;
     const cs = await ciphersuite();
     const tag = await recipientTag(this.identity.address);
@@ -600,6 +622,9 @@ export class Chat {
         signaturePrivateKey: this.identity.signKey,
       };
       const state = await mls.joinGroup(welcome, pubMsg.keyPackage, priv, mls.emptyPskIndex, cs, undefined, undefined, this.clientConfig());
+      // Already in this group (e.g. joined in another call): never keep a second copy of it.
+      const existing = this.groups.get(b64(state.groupContext.groupId));
+      if (existing?.active) return existing;
       // One-time keys are deleted the moment they are used (box 2). Last-resort keys stay.
       if (key.startsWith('chat/kp/')) await eph.delete(key);
       const raw = await this.provider.orderedLog.read(space, 0);
