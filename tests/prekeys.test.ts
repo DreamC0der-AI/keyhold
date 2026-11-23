@@ -255,4 +255,27 @@ describe('pre-keys (build option preKeys)', () => {
     const [e] = await w.session('mem:erin').inviteInbox.list();
     expect(e!.payload).toBeUndefined();
   });
+
+  it('inviteMany adds everyone in one commit and one drop-box write; a bad address fails alone', async () => {
+    const { w, opts } = setup();
+    const bob = await makeUser(w.session('mem:bob'), 'mem:bob', opts);
+    const carol = await makeUser(w.session('mem:carol'), 'mem:carol', opts);
+    const dave = await makeUser(w.session('mem:dave'), 'mem:dave', opts);
+    for (const u of [carol, dave]) await u.chat.refreshPreKey();
+    const g = await bob.chat.createGroup('group', 'team');
+    const before = { log: (g as unknown as { meta: { logNext: number } }).meta.logNext, puts: w.calls.get('dropBox.putMany') ?? 0 };
+    const res = await g.inviteMany([carol.address, dave.address, 'mem:nobody'], { requireIdentity: true });
+    expect(res.map((r) => [r.address, !!r.ticket, r.error?.message ?? ''])).toEqual([
+      [carol.address, true, ''],
+      [dave.address, true, ''],
+      ['mem:nobody', false, 'mem:nobody has no identity yet'],
+    ]);
+    expect((g as unknown as { meta: { logNext: number } }).meta.logNext - before.log).toBe(1); // one commit adds both
+    expect((w.calls.get('dropBox.putMany') ?? 0) - before.puts).toBe(1); // tickets + Welcomes together
+    await g.send({ t: 'text', body: 'hi both' });
+    for (const u of [carol, dave]) {
+      const [joined] = await u.chat.acceptInvites();
+      expect(texts(await joined!.sync())).toContain('hi both');
+    }
+  });
 });

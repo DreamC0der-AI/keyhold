@@ -286,6 +286,15 @@ function memorySession(w: MemoryWorld, self: Address): StorageProvider {
         s.drop.set(tag, list);
         return id;
       },
+      async putMany(ref, items) {
+        w.count('dropBox.putMany');
+        const s = space(ref);
+        return items.map(({ tag, data }) => {
+          const id = rid();
+          s.drop.set(tag, [...(s.drop.get(tag) ?? []), { id, data: copy(data) }]);
+          return id;
+        });
+      },
       async list(ref, tag) {
         return (space(ref).drop.get(tag) ?? []).map((i) => ({ id: i.id, data: copy(i.data) }));
       },

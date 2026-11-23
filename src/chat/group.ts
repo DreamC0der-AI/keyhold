@@ -797,6 +797,21 @@ export class Chat {
   }
 }
 
+/** One person's outcome of `inviteMany`. */
+export interface InviteResult {
+  address: Address;
+  ticket?: InviteTicket;
+  error?: Error;
+}
+
+interface PreparedInvite {
+  address: Address;
+  view?: DirectoryView;
+  kps: mls.KeyPackage[];
+  ticket?: InviteTicket;
+  error?: Error;
+}
+
 export interface InviteOptions {
   /** Only accept people who already have an identity. */
   requireIdentity?: boolean;
@@ -1088,10 +1103,38 @@ export class Group {
    * access and drop a notice in their inbox (box 11). They join when they accept.
    */
   invite(address: Address, options: InviteOptions = {}): Promise<InviteTicket> {
-    return this.exclusive(() => this.inviteNow(address, options));
+    return this.inviteMany([address], options).then(([r]) => {
+      if (r!.error) throw r!.error;
+      return r!.ticket!;
+    });
   }
 
-  private async inviteNow(address: Address, options: InviteOptions): Promise<InviteTicket> {
+  /**
+   * Invite several people at once. Their identities and pre-keys are read side by side, every
+   * pre-key device is added in ONE commit, all tickets and Welcomes go up together (one write
+   * where the provider can batch), and the channel invitations go out in parallel. Each person
+   * gets their own result: one failing doesn't stop the others.
+   */
+  async inviteMany(addresses: Address[], options: InviteOptions = {}): Promise<InviteResult[]> {
+    // Reads that don't depend on group state run before taking the lock, all at once.
+    const prepared = await Promise.all(addresses.map((a) => this.prepareInvite(a, options)));
+    return this.exclusive(() => this.inviteManyNow(prepared, options));
+  }
+
+  private async prepareInvite(address: Address, options: InviteOptions): Promise<PreparedInvite> {
+    try {
+      const look = await this.chat.opts.registry.lookup(address);
+      if (look.status === 'key-changed') throw new KeyholdError('key_changed', `${address} has a new identity key; confirm it first`);
+      if (look.status === 'none' && options.requireIdentity) throw new KeyholdError('not_found', `${address} has no identity yet`);
+      const view = look.status === 'ok' ? look.view : undefined;
+      const kps = view ? await this.chat.preKeysOf(view) : [];
+      return { address, view, kps };
+    } catch (error) {
+      return { address, kps: [], error: error as Error };
+    }
+  }
+
+  private async inviteManyNow(people: PreparedInvite[], options: InviteOptions): Promise<InviteResult[]> {
     this.requireActive();
     await this.pull();
     const me = this.chat.identity;
@@ -1099,39 +1142,80 @@ export class Group {
     if (policy.adds === 'none' || (policy.adds === 'admins' && !policy.admins.includes(me.fingerprint))) {
       throw new KeyholdError('policy_rejected', 'you may not invite people to this group');
     }
-    const people = new Set(leaves(this.state).map((l) => l.root));
-    if (policy.maxPeople > 0 && people.size >= policy.maxPeople) throw new KeyholdError('policy_rejected', `at most ${policy.maxPeople} people`);
-    const look = await this.chat.opts.registry.lookup(address);
-    if (look.status === 'key-changed') throw new KeyholdError('key_changed', `${address} has a new identity key; confirm it first`);
-    if (look.status === 'none' && options.requireIdentity) throw new KeyholdError('not_found', `${address} has no identity yet`);
+    const inGroup = new Set(leaves(this.state).map((l) => l.root));
+    let room = policy.maxPeople > 0 ? policy.maxPeople - inGroup.size : Infinity;
+    for (const p of people) {
+      if (p.error) continue;
+      if (p.view && inGroup.has(p.view.fingerprint)) continue; // already in: no extra seat
+      if (room <= 0) p.error = new KeyholdError('policy_rejected', `at most ${policy.maxPeople} people`);
+      else room--;
+    }
+    const ok = people.filter((p) => !p.error);
     // With pre-keys, add every device of theirs that has one now, so the group can write to
     // them before they accept. The ticket still goes out: it lets a device that has no usable
     // pre-key (or whose Welcome can't be opened) join when they accept.
-    const kps = look.status === 'ok' ? await this.chat.preKeysOf(look.view) : [];
-    if (look.status === 'ok' && kps.length) await this.addWithPreKeys(look.view, kps);
-    const ticket = await this.issueTicket(address, look.status === 'ok' ? look.view.fingerprint : undefined, this.chat.now() + (options.ttlMs ?? 7 * DAY));
-    if (!ticket.toRoot) this.meta.awaitingUpgradeUntil = Math.max(this.meta.awaitingUpgradeUntil ?? 0, ticket.expiresAt);
-    const payload = options.note && kps.length && this.chat.opts.features.inboxPayload ? await sealInviteNote(options.note, kps, this.chat.identity.address) : undefined;
-    await this.grantChannel(address, ticket.expiresAt, payload);
-    return ticket;
+    const drops: { tag: string; data: Bytes }[] = [];
+    const welcome = await this.addWithPreKeys(ok.flatMap((p) => p.kps));
+    const expiresAt = this.chat.now() + (options.ttlMs ?? 7 * DAY);
+    const cs = await ciphersuite();
+    for (const p of ok) {
+      const tag = await recipientTag(p.address);
+      if (welcome && p.kps.length) drops.push({ tag, data: welcome });
+      p.ticket = await signTicket({ group: this.meta.groupId, to: p.address, toRoot: p.view?.fingerprint, by: me.cert, expiresAt, nonce: b64(randomBytes(16)) }, (m) =>
+        cs.signature.sign(me.signKey, m),
+      );
+      drops.push({ tag, data: encodeTicket(p.ticket) });
+      if (!p.ticket.toRoot) this.meta.awaitingUpgradeUntil = Math.max(this.meta.awaitingUpgradeUntil ?? 0, p.ticket.expiresAt);
+    }
+    await this.putDrops(drops);
+    // Channel invitations are independent of each other. Only a space owner's are; anyone else
+    // asks the owner's app through the group, one message at a time.
+    const owner = await this.chat.provider.channel.canManage(this.meta.space);
+    const grant = async (p: PreparedInvite) => {
+      try {
+        const payload = options.note && p.kps.length && this.chat.opts.features.inboxPayload ? await sealInviteNote(options.note, p.kps, me.address) : undefined;
+        await this.grantChannel(p.address, expiresAt, payload);
+      } catch (error) {
+        p.error = error as Error;
+      }
+    };
+    if (owner) await Promise.all(ok.map(grant));
+    else for (const p of ok) await grant(p);
+    return people.map((p) => (p.error ? { address: p.address, error: p.error } : { address: p.address, ticket: p.ticket! }));
   }
 
-  private async addWithPreKeys(view: DirectoryView, kps: mls.KeyPackage[]) {
+  /** All drop-box items in one write when the provider can batch, else one by one. */
+  private async putDrops(items: { tag: string; data: Bytes }[]) {
+    const box = this.chat.provider.dropBox;
+    if (!items.length) return;
+    if (box.putMany && items.length > 1) await box.putMany(this.meta.space, items);
+    else for (const it of items) await box.put(this.meta.space, it.tag, it.data);
+  }
+
+  /** Add these pre-key devices in one commit. Returns the encoded Welcome, if one was made. */
+  private async addWithPreKeys(kps: mls.KeyPackage[]): Promise<Bytes | undefined> {
+    if (!kps.length) return undefined;
     const fresh = () => {
       const inTree = new Set(leaves(this.state).map((l) => l.device));
-      return kps.filter((kp) => !inTree.has(b64(kp.leafNode.signaturePublicKey)));
+      const seen = new Set<string>();
+      return kps.filter((kp) => {
+        const d = b64(kp.leafNode.signaturePublicKey);
+        if (inTree.has(d) || seen.has(d)) return false;
+        seen.add(d);
+        return true;
+      });
     };
-    if (!fresh().length) return;
+    if (!fresh().length) return undefined;
     let res: mls.CreateCommitResult | undefined;
     try {
       res = await this.commit(() => fresh().map((kp) => ({ proposalType: 'add', add: { keyPackage: kp } }) as mls.Proposal), () => fresh().length > 0);
     } catch (err) {
       // A broken or stale pre-key must not block the invite: the ticket still works.
       if ((err as KeyholdError).code === 'conflict' || (err as KeyholdError).code === 'policy_rejected') throw err;
-      return;
+      return undefined;
     }
-    if (!res?.welcome) return;
-    await this.chat.provider.dropBox.put(this.meta.space, await recipientTag(view.address), encodeMsg({ wireformat: 'mls_welcome', version: 'mls10', welcome: res.welcome }));
+    if (!res?.welcome) return undefined;
+    return encodeMsg({ wireformat: 'mls_welcome', version: 'mls10', welcome: res.welcome });
   }
 
   /**
