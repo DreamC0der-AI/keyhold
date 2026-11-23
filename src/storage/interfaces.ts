@@ -131,6 +131,8 @@ export interface BlobStore {
 /** Box 8. Items for one recipient inside a space; deleted after reading. */
 export interface DropBox {
   put(space: SpaceRef, recipientTag: string, data: Bytes): Promise<string>;
+  /** Optional: several items, for any recipients, in one write. Returns their ids in order. */
+  putMany?(space: SpaceRef, items: { tag: string; data: Bytes }[]): Promise<string[]>;
   list(space: SpaceRef, recipientTag: string): Promise<MailboxItem[]>;
   delete(space: SpaceRef, recipientTag: string, id: string): Promise<void>;
 }
