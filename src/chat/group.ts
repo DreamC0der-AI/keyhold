@@ -17,6 +17,9 @@ import * as mls from 'ts-mls';
 import { unprotectPrivateMessage } from 'ts-mls/messageProtection.js';
 import { makeKeyPackageRef } from 'ts-mls/keyPackage.js';
 import { decodeRatchetTree } from 'ts-mls/ratchetTree.js';
+import { decryptSenderData } from 'ts-mls/privateMessage.js';
+import { decryptGroupInfo, decryptGroupSecrets } from 'ts-mls/welcome.js';
+import { accumulatePskSecret } from 'ts-mls/pskIndex.js';
 import { randomBytes, sha256, toHex, utf8 } from '../util/bytes.js';
 import { b64, jsonBytes, parseJsonBytes, unb64 } from '../util/codec.js';
 import { KeyholdError } from '../util/errors.js';
@@ -32,6 +35,7 @@ import {
   type DeviceCertificate,
   type DirectoryView,
   type IdentityRegistry,
+  type LookupResult,
   type RootKey,
 } from './identity.js';
 import {
@@ -44,6 +48,7 @@ import {
   signTicket,
   verifyTicket,
   assertAllowed,
+  sameOwner,
   type GroupPolicy,
   type InviteTicket,
   type MemberLeaf,
@@ -169,6 +174,8 @@ interface GroupMeta {
   seenHashes?: string[];
   /** Decrypted messages not yet taken by `onMessage` (it threw), oldest first. */
   undelivered?: StoredMessage[];
+  /** Application-message generations seen, by "epoch:senderLeaf", to notice dropped messages. */
+  gens?: Record<string, GenTrack>;
 }
 
 interface OutboxItem {
@@ -212,6 +219,19 @@ const unsentByError = new WeakMap<object, AppMessage[]>();
  */
 export function unsentMessages(error: unknown): AppMessage[] | undefined {
   return typeof error === 'object' && error !== null ? unsentByError.get(error) : undefined;
+}
+
+/**
+ * Each sender's application messages in an epoch are numbered 0, 1, 2... by MLS (the generation,
+ * authenticated by the key it selects). A number we skipped over is a hole: noticed in one sync
+ * (`fresh`), reported if the next sync still hasn't filled it (`waiting`), since the mailbox may
+ * list messages out of order. Holes in epochs whose keys are gone are reported at once.
+ */
+interface GenTrack {
+  hi: number;
+  fresh: number[];
+  waiting: number[];
+  from: ReceivedMessage['from'];
 }
 
 export interface RotationPolicy {
@@ -299,6 +319,12 @@ export type GroupEvent =
    * `onMessage` again first thing on the next sync, in order. `waiting` is how many wait.
    */
   | { type: 'delivery-failed'; reason: string; waiting: number }
+  /**
+   * `missing` messages from this sender in `epoch` never arrived: the storage may have dropped
+   * them (or the sender's upload failed). Reported once, after a later sync still lacked them.
+   * A dropped LAST message of an epoch can't be noticed this way.
+   */
+  | { type: 'gap'; from: ReceivedMessage['from']; epoch: bigint; missing: number }
   | { type: 'removed' }
   | { type: 'rotated'; epoch: bigint }
   /** The channel no longer lets this account in. Usually follows a removal. */
@@ -328,6 +354,20 @@ function unjoinedLeaf(node: mls.NodeLeaf): boolean {
   return leaf.leafNodeSource === 'key_package' && leaf.extensions.some((e) => (e.extensionType as unknown) === PREKEY_EXTENSION);
 }
 
+/**
+ * RFC 9420 5.3.1: a leaf replaced in place (commit path, update) must carry a valid successor of
+ * its credential. For us that is the same root and the same address. Leaves removed by the
+ * commit may be refilled by an add, so they are not compared. Deterministic: trees only.
+ */
+function successionViolation(before: mls.ClientState, after: mls.ClientState, removed: ReadonlySet<number>): string | undefined {
+  const old = new Map(leaves(before).map((l) => [l.leafIndex, l]));
+  for (const l of leaves(after)) {
+    const o = old.get(l.leafIndex);
+    if (o && !removed.has(l.leafIndex) && !sameOwner(o, l)) return 'a leaf may not change its owner or address';
+  }
+  return undefined;
+}
+
 function leafFromCredential(cred: mls.Credential, index = -1): MemberLeaf | undefined {
   const cert = certificateFromCredential(cred as never);
   if (!cert || !verifyDeviceCertificate(cert)) return undefined;
@@ -345,7 +385,7 @@ function summarize(p: mls.ProposalWithSender): ProposalSummary {
     case 'remove':
       return { type: 'remove', sender, removed: prop.remove.removed };
     case 'update':
-      return { type: 'update', sender };
+      return { type: 'update', sender, leaf: leafFromCredential(prop.update.leafNode.credential) };
     case 'external_init':
       return { type: 'external_init', sender };
     case 'group_context_extensions': {
@@ -670,6 +710,10 @@ export class Chat {
       const groupId = gi.groupContext.groupId;
       const policy = decodePolicy(gi.groupContext.extensions as never);
       const treeLeaves = leavesOfGroupInfo(gi);
+      // Anyone who can write the log can put a GroupInfo of a group they made there. Only join a
+      // tree signed by someone we can verify (joinGroupExternal checks the signature itself).
+      const tree = ratchetTreeOfGroupInfo(gi);
+      if (!tree || (await this.untrustedTree(tree, gi.signer))) return undefined;
       // Another device of ours is in: join as one more device. A leaf of this very device (added
       // with a pre-key we can't open) doesn't count: it is replaced, so we need a ticket.
       const myDevice = b64(this.identity.publicKey);
@@ -763,16 +807,28 @@ export class Chat {
         hpkePrivateKey: unb64(stored.priv.hpke!),
         signaturePrivateKey: this.identity.signKey,
       };
-      const state = await mls.joinGroup(welcome, pubMsg.keyPackage, priv, mls.emptyPskIndex, cs, undefined, undefined, this.clientConfig());
+      // Anyone who can write our drop box (the storage operator, any collaborator) can make a
+      // Welcome for our published pre-key into a group of their own with the real group id. So a
+      // Welcome counts only when its signer is a verified device and its tree matches the log; a
+      // bad one is skipped, and the next Welcome or the ticket is tried instead.
+      let state: mls.ClientState;
+      let signer: number;
+      try {
+        signer = await welcomeSigner(welcome, s.newMember, priv.initPrivateKey, cs);
+        state = await mls.joinGroup(welcome, pubMsg.keyPackage, priv, mls.emptyPskIndex, cs, undefined, undefined, this.clientConfig());
+      } catch {
+        continue;
+      }
+      if (await this.untrustedTree(state.ratchetTree, signer)) continue;
       // Already in this group (e.g. joined in another call): never keep a second copy of it.
       const existing = this.groups.get(b64(state.groupContext.groupId));
       if (existing?.active) return existing;
-      // One-time keys are deleted the moment they are used (box 2). Last-resort keys stay.
-      if (key.startsWith('chat/kp/')) await eph.delete(key);
       const raw = await this.provider.orderedLog.read(space, 0);
       const scan = await scanLog(raw);
-      const at = scan.epochIndex.get(String(state.groupContext.epoch));
-      if (at === undefined) throw new KeyholdError('bad_format', 'the commit that added us is not in the log');
+      const at = await logIndexOf(raw, state.groupContext);
+      if (at === undefined) continue; // the commit that added us is not in the log: not this group
+      // One-time keys are deleted the moment they are used (box 2). Last-resort keys stay.
+      if (key.startsWith('chat/kp/')) await eph.delete(key);
       const meta = this.newMeta(b64(state.groupContext.groupId), space, at + 1, scan.hashes[at]!);
       meta.hashes = scan.hashes.slice(0, at + 1);
       // Only tickets burned up to the add: later entries are replayed and burn their own.
@@ -785,6 +841,47 @@ export class Chat {
       await g.persist();
       this.groups.set(meta.groupId, g);
       return g;
+    }
+    return undefined;
+  }
+
+  /**
+   * Why we must not join a group with this tree, signed by leaf `signer`; undefined when we may.
+   * Device certificates are self-issued, so a leaf can claim any address; the directory (with
+   * our TOFU pins) says which root an address belongs to. The signer (who added us, or who made
+   * the GroupInfo) must be a current device of the root its address publishes, and no leaf may
+   * claim an address whose directory names another root. Addresses with no directory can't be
+   * checked; the app shows them as unverified.
+   */
+  async untrustedTree(tree: mls.RatchetTree, signer: number): Promise<string | undefined> {
+    const me = this.identity;
+    const all = leaves({ ratchetTree: tree } as unknown as mls.ClientState);
+    const looked = new Map<Address, LookupResult | null>();
+    const look = async (a: Address) => {
+      if (!looked.has(a)) looked.set(a, await this.opts.registry.lookup(a).catch(() => null));
+      return looked.get(a)!;
+    };
+    const s = all.find((l) => l.leafIndex === signer);
+    if (!s) return 'the signer is not in the group';
+    for (const l of [s, ...all]) {
+      const isSigner = l === s;
+      if (l.address === me.address) {
+        if (l.root !== me.fingerprint) return `a leaf claims our address ${l.address} with another key`;
+        continue;
+      }
+      const r = await look(l.address);
+      if (!r) return `cannot verify ${l.address}`;
+      if (r.status === 'none') {
+        if (isSigner) return `the inviter ${l.address} has no identity`;
+        continue;
+      }
+      if (r.status === 'key-changed') {
+        if (isSigner) return `the inviter ${l.address} has a new identity key`;
+        if (l.root !== r.pinned.fingerprint && l.root !== r.view.fingerprint) return `${l.address} is in the group with another key`;
+        continue;
+      }
+      if (l.root !== r.view.fingerprint) return `${l.address} is in the group with another key`;
+      if (isSigner && r.view.revoked.has(l.device)) return `the inviter's device was revoked`;
     }
     return undefined;
   }
@@ -1038,10 +1135,58 @@ async function scanLog(raw: Bytes[]): Promise<LogScan> {
   return { hashes, lastHash: prev, lastGi, usedNonces, epochIndex };
 }
 
-function leavesOfGroupInfo(gi: mls.GroupInfo): MemberLeaf[] {
+/** Leaf index of the member that signed a Welcome's GroupInfo (joinGroup verifies the signature). */
+async function welcomeSigner(welcome: mls.Welcome, ref: Uint8Array, initPrivateKey: Uint8Array, cs: mls.CiphersuiteImpl): Promise<number> {
+  const secrets = await decryptGroupSecrets(await cs.hpke.importPrivateKey(initPrivateKey), ref, welcome, cs.hpke);
+  if (!secrets) throw new KeyholdError('bad_format', 'bad Welcome');
+  const [psk] = await accumulatePskSecret(secrets.psks, mls.emptyPskIndex, cs, new Uint8Array(cs.kdf.size));
+  const gi = await decryptGroupInfo(welcome, secrets.joinerSecret, psk, cs);
+  if (!gi) throw new KeyholdError('bad_format', 'bad Welcome');
+  return gi.signer;
+}
+
+/**
+ * Index of the log entry that created this exact epoch: same epoch, tree and transcript as the
+ * GroupInfo it carries. Old entries without a GroupInfo match on the epoch alone.
+ */
+async function logIndexOf(raw: Bytes[], ctx: mls.GroupContext): Promise<number | undefined> {
+  const same = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((x, i) => x === b[i]);
+  let prev = '';
+  let loose: number | undefined;
+  for (let i = 0; i < raw.length; i++) {
+    let e: LogEntry | undefined;
+    try {
+      e = parseJsonBytes<LogEntry>(raw[i]!, 'log entry');
+    } catch {
+      e = undefined;
+    }
+    const ok = !!e && e.v === 1 && e.i === i && e.prev === prev;
+    prev = await hashEntry(raw[i]!);
+    if (!ok || !e || e.epoch !== String(ctx.epoch)) continue;
+    if (!e.gi) {
+      loose ??= i;
+      continue;
+    }
+    try {
+      const m = decodeMsg(unb64(e.gi));
+      if (m.wireformat !== 'mls_group_info') continue;
+      const g = m.groupInfo.groupContext;
+      if (same(g.groupId, ctx.groupId) && same(g.treeHash, ctx.treeHash) && same(g.confirmedTranscriptHash, ctx.confirmedTranscriptHash)) return i;
+    } catch {
+      continue;
+    }
+  }
+  return loose;
+}
+
+function ratchetTreeOfGroupInfo(gi: mls.GroupInfo): mls.RatchetTree | undefined {
   const ext = gi.extensions.find((e) => e.extensionType === 'ratchet_tree' || e.extensionType === 2);
-  if (!ext) return [];
-  return leaves({ ratchetTree: decodeTree(ext.extensionData) } as unknown as mls.ClientState);
+  return ext ? decodeTree(ext.extensionData) : undefined;
+}
+
+function leavesOfGroupInfo(gi: mls.GroupInfo): MemberLeaf[] {
+  const tree = ratchetTreeOfGroupInfo(gi);
+  return tree ? leaves({ ratchetTree: tree } as unknown as mls.ClientState) : [];
 }
 
 function decodeTree(b: Uint8Array): mls.RatchetTree {
@@ -1866,6 +2011,7 @@ export class Group {
       if (!this.active) break;
     }
     await this.drainPending(out, (ep) => BigInt(ep) <= this.epoch);
+    if (withAutomation && this.active) this.reportGaps(out); // not on the retries inside one sync
     if (pendingCommit) await this.chat.opts.device.ephemeral.delete(pendingKey); // it never landed
     await this.persist();
 
@@ -1911,13 +2057,16 @@ export class Group {
     const cfg = st.clientConfig.keyRetentionConfig;
     let res: Awaited<ReturnType<typeof unprotectPrivateMessage>>;
     let tree: mls.RatchetTree;
+    let senderDataSecret: Uint8Array;
     if (pm.epoch === st.groupContext.epoch) {
+      senderDataSecret = st.keySchedule.senderDataSecret;
       res = await unprotectPrivateMessage(st.keySchedule.senderDataSecret, pm, st.secretTree, st.ratchetTree, st.groupContext, cfg, cs);
       tree = st.ratchetTree;
       this.state = { ...st, secretTree: res.tree };
     } else {
       const r = st.historicalReceiverData.get(pm.epoch);
       if (!r) throw new KeyholdError('decrypt_failed', `keys for epoch ${pm.epoch} are gone`);
+      senderDataSecret = r.senderDataSecret;
       res = await unprotectPrivateMessage(r.senderDataSecret, pm, r.secretTree, r.ratchetTree, r.groupContext, cfg, cs);
       tree = r.ratchetTree;
       const hist = new Map(st.historicalReceiverData);
@@ -1930,11 +2079,46 @@ export class Group {
     const node = tree[content.sender.leafIndex * 2];
     if (!node || node.nodeType !== 'leaf') throw new KeyholdError('bad_format', 'unknown sender');
     const cert = certificateFromCredential(node.leaf.credential as never)!;
+    const from = { fingerprint: fingerprint(unb64(cert.root)), address: cert.address, deviceId: cert.deviceId };
+    // The message opened, so the generation in its sender data is the one its key came from.
+    const sd = await decryptSenderData(pm, senderDataSecret, cs);
+    if (sd) this.noteGeneration(pm.epoch, content.sender.leafIndex, sd.generation, from);
     return {
       message: decodeAppMessage(content.applicationData),
-      from: { fingerprint: fingerprint(unb64(cert.root)), address: cert.address, deviceId: cert.deviceId },
+      from,
       epoch: pm.epoch,
     };
+  }
+
+  private noteGeneration(epoch: bigint, leaf: number, gen: number, from: ReceivedMessage['from']) {
+    const all = (this.meta.gens ??= {});
+    const t = (all[`${epoch}:${leaf}`] ??= { hi: -1, fresh: [], waiting: [], from });
+    if (gen > t.hi) {
+      // MLS ratchets at most a few hundred steps ahead, so this stays small.
+      for (let g = Math.max(t.hi + 1, gen - 1000); g < gen; g++) t.fresh.push(g);
+      t.hi = gen;
+    } else {
+      t.fresh = t.fresh.filter((g) => g !== gen);
+      t.waiting = t.waiting.filter((g) => g !== gen);
+    }
+  }
+
+  /** End of a sync: report holes a previous sync already saw (see GenTrack). */
+  private reportGaps(out: SyncResult) {
+    const all = this.meta.gens;
+    if (!all) return;
+    const oldest = this.epoch - BigInt(this.chat.opts.retainEpochs);
+    for (const [k, t] of Object.entries(all)) {
+      const epoch = BigInt(k.slice(0, k.indexOf(':')));
+      const gone = epoch < oldest; // its keys are gone: nothing can fill a hole any more
+      const due = gone ? t.waiting.length + t.fresh.length : t.waiting.length;
+      if (due) out.events.push({ type: 'gap', from: t.from, epoch, missing: due });
+      if (gone) delete all[k];
+      else {
+        t.waiting = t.fresh;
+        t.fresh = [];
+      }
+    }
   }
 
   private async handleSystem(m: ReceivedMessage) {
@@ -1984,9 +2168,11 @@ export class Group {
 
     let verdict: { ok: boolean; reason?: string } = { ok: true };
     const policy = this.policy;
+    const removed = new Set<number>();
     const callback: mls.IncomingMessageCallback = (incoming) => {
       const proposals = incoming.kind === 'commit' ? incoming.proposals : [incoming.proposal];
       const summaries = proposals.map(summarize);
+      for (const s of summaries) if (s.type === 'remove') removed.add(s.removed);
       if (incoming.kind === 'proposal') {
         const s = summaries[0]!;
         // Standalone proposals: only key updates and removes (leaving) are allowed.
@@ -2013,6 +2199,10 @@ export class Group {
       return reject((err as Error).message);
     }
     if (result.kind !== 'newState' || result.actionTaken === 'reject' || !verdict.ok) return reject(verdict.reason ?? 'rejected');
+    // The committer's new path leaf (and any update) replaces a leaf in place: it must stay the
+    // same person under the same address. The callback can't see the path, so compare the trees.
+    const swapped = successionViolation(this.state, result.newState, removed);
+    if (swapped) return reject(swapped);
     this.state = result.newState;
     result.consumed.forEach(mls.zeroOutUint8Array);
     if (e.kind === 'commit') this.meta.needsHeal = false;
