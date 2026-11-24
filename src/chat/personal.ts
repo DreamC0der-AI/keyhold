@@ -71,6 +71,13 @@ export interface HistoryRecord {
 
 export class PersonalData {
   private queue = new Map<string, Item>();
+  /**
+   * Changes taken out of the queue by a flush and being written now. A `set()` during the write
+   * goes into a fresh queue entry, so it is written by the next flush instead of being lost.
+   */
+  private writing = new Map<string, Item>();
+  /** Flushes run one after another. */
+  private flushing: Promise<unknown> = Promise.resolve();
   private cache = new Map<string, { item: Item; version: string }>();
   /** Versions already seen by `changes()`. */
   private seen = new Map<string, string>();
@@ -142,9 +149,15 @@ export class PersonalData {
     this.queue.set(id, q);
   }
 
-  /** Changes queued and not yet written. */
+  /** Records with changes not yet written (queued, or being written by a flush in progress). */
   get pending() {
-    return this.queue.size;
+    return new Set([...this.queue.keys(), ...this.writing.keys()]).size;
+  }
+
+  /** Whether this record has changes not yet written (queued, or being written right now). */
+  async isPending(collection: Collection, key: string): Promise<boolean> {
+    const id = await this.idFor(collection, key);
+    return this.queue.has(id) || this.writing.has(id);
   }
 
   /**
@@ -168,7 +181,7 @@ export class PersonalData {
   async get<T extends object = Record<string, unknown>>(collection: Collection, key: string, fresh = true): Promise<T | undefined> {
     const id = await this.idFor(collection, key);
     const base = fresh ? await this.load(id) : this.cache.get(id) ?? (await this.load(id));
-    const merged = merge(base?.item, this.queue.get(id));
+    const merged = merge(merge(base?.item, this.writing.get(id)), this.queue.get(id));
     if (!merged) return undefined;
     const out: Record<string, unknown> = {};
     for (const [k, f] of Object.entries(merged.f)) if (f.v !== null) out[k] = f.v;
@@ -188,21 +201,47 @@ export class PersonalData {
     return out;
   }
 
-  /** Write queued changes, merging with whatever other devices wrote meanwhile. */
-  async flush(): Promise<number> {
+  /**
+   * Write queued changes, merging with whatever other devices wrote meanwhile. Changes made
+   * while a flush runs stay queued for the next one (`pending` counts them). Resolves to the
+   * number of writes.
+   */
+  flush(): Promise<number> {
+    const run = this.flushing.then(
+      () => this.flushNow(),
+      () => this.flushNow(),
+    );
+    this.flushing = run.catch(() => undefined);
+    return run;
+  }
+
+  private async flushNow(): Promise<number> {
     let writes = 0;
-    for (const [id, q] of [...this.queue]) {
-      for (let attempt = 0; ; attempt++) {
-        if (attempt > 8) throw new KeyholdError('conflict', 'personal store kept changing');
-        const cur = await this.load(id);
-        const merged = merge(cur?.item, q)!;
-        const sealed = await seal(this.key, jsonBytes(merged), this.ctx(id), { compress: true });
-        if ((await this.store.put(id, sealed, cur?.version ?? null)) === 'ok') {
-          writes++;
-          break;
-        }
-      }
+    for (const id of [...this.queue.keys()]) {
+      const q = this.queue.get(id);
+      if (!q) continue;
+      // Take the entry out before writing: a set() from now on starts a new one.
       this.queue.delete(id);
+      this.writing.set(id, q);
+      try {
+        for (let attempt = 0; ; attempt++) {
+          if (attempt > 8) throw new KeyholdError('conflict', 'personal store kept changing');
+          const cur = await this.load(id);
+          const merged = merge(cur?.item, q)!;
+          const sealed = await seal(this.key, jsonBytes(merged), this.ctx(id), { compress: true });
+          if ((await this.store.put(id, sealed, cur?.version ?? null)) === 'ok') {
+            writes++;
+            this.cache.delete(id); // its version changed; read it again when needed
+            break;
+          }
+        }
+      } catch (e) {
+        // Not written: back into the queue, together with anything set meanwhile (merging is order-free).
+        this.queue.set(id, merge(q, this.queue.get(id))!);
+        throw e;
+      } finally {
+        this.writing.delete(id);
+      }
     }
     return writes;
   }
