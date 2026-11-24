@@ -135,7 +135,8 @@ export interface MemberLeaf {
 export type ProposalSummary =
   | { type: 'add'; sender: number | undefined; leaf: MemberLeaf }
   | { type: 'remove'; sender: number | undefined; removed: number }
-  | { type: 'update'; sender: number | undefined }
+  /** `leaf`: the credential of the new leaf node (undefined when it is not a valid device certificate). */
+  | { type: 'update'; sender: number | undefined; leaf?: MemberLeaf }
   | { type: 'policy'; sender: number | undefined; policy: GroupPolicy | undefined }
   | { type: 'external_init'; sender: number | undefined }
   | { type: 'other'; sender: number | undefined; name: string };
@@ -180,8 +181,14 @@ export function checkCommit(c: CommitCheck): Verdict {
     const actorLeaf = p.sender ?? c.committer;
     const actor = c.joiner && c.committer === undefined && p.sender === undefined ? c.joiner.leaf.root : rootOf(actorLeaf);
     switch (p.type) {
-      case 'update':
+      case 'update': {
+        // RFC 9420 5.3.1: a new credential must be a valid successor of the old one. For us that
+        // is the same person (root) under the same address; only the device key may change.
+        const old = byLeaf.get(actorLeaf ?? -1);
+        if (!p.leaf) return deny('update without a valid device certificate');
+        if (old && !sameOwner(old, p.leaf)) return deny('a leaf may not change its owner or address');
         break;
+      }
       case 'add':
         if (!mayAdd(c.policy, actor)) return deny('only allowed members may add people');
         if (isBanned(c.policy, p.leaf)) return deny('cannot add a banned device');
@@ -250,6 +257,11 @@ export function checkCommit(c: CommitCheck): Verdict {
   if (c.policy.maxPeople > 0 && roots.size > c.policy.maxPeople) return deny(`at most ${c.policy.maxPeople} people`);
   if (roots.size > 0 && !nextPolicy.admins.some((a) => roots.has(a))) return deny('the group must keep at least one admin who is a member');
   return { ok: true };
+}
+
+/** A leaf's successor must keep its root and address (RFC 9420 credential succession). */
+export function sameOwner(a: Pick<MemberLeaf, 'root' | 'address'>, b: Pick<MemberLeaf, 'root' | 'address'>) {
+  return a.root === b.root && a.address === b.address;
 }
 
 function isBanned(p: GroupPolicy, leaf: MemberLeaf) {
