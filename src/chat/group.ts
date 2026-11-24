@@ -161,6 +161,57 @@ interface GroupMeta {
   joinedEpoch?: string;
   /** When this device first saw each device leaf that was added but hasn't joined (admins clean up). */
   unjoinedSince?: Record<string, number>;
+  /** Our messages, encrypted and saved, not yet known to be posted. A retry posts the same bytes. */
+  outbox?: OutboxItem[];
+  /** Hashes of our recent ciphertexts: our own mail even when we never learnt its id. */
+  ownHashes?: string[];
+  /** Hashes of recent mail from others: a copy posted twice is opened once. */
+  seenHashes?: string[];
+  /** Decrypted messages not yet taken by `onMessage` (it threw), oldest first. */
+  undelivered?: StoredMessage[];
+}
+
+interface OutboxItem {
+  message: AppMessage;
+  /** The MLS ciphertext (base64) and its hash. */
+  wire: string;
+  hash: string;
+  /** Mail id chosen before the first post (providers with `mailbox.newId`). */
+  id?: string;
+  epoch: string;
+}
+
+interface StoredMessage {
+  message: AppMessage;
+  from: ReceivedMessage['from'];
+  epoch: string;
+  own?: boolean;
+}
+
+/** In-progress chat creation (box 2: holds the new group's secrets). */
+interface Creating {
+  groupId: string;
+  kind: 'dm' | 'group';
+  name?: string;
+  /** The genesis log entry and the group state, base64. */
+  entry: string;
+  state: string;
+  at: number;
+  /** Set once the channel made the space. */
+  space?: SpaceRef;
+}
+const CREATING = 'chat/creating/';
+
+/** Sends that failed, by the error they failed with: see `unsentMessages`. */
+const unsentByError = new WeakMap<object, AppMessage[]>();
+
+/**
+ * The messages a failed `send` (or `resend`) left unsent, from the error it threw. They are
+ * kept encrypted on this device: retry with `group.resend(message.id)` (never a fresh send,
+ * which would be a second message), or drop with `group.discardUnsent(message.id)`.
+ */
+export function unsentMessages(error: unknown): AppMessage[] | undefined {
+  return typeof error === 'object' && error !== null ? unsentByError.get(error) : undefined;
 }
 
 export interface RotationPolicy {
@@ -243,6 +294,11 @@ export type GroupEvent =
   | { type: 'policy'; policy: GroupPolicy }
   | { type: 'rejected'; index: number; reason: string }
   | { type: 'undecryptable'; id: string; reason: string }
+  /**
+   * `onMessage` threw: the message (and any after it) is kept, decrypted, and handed to
+   * `onMessage` again first thing on the next sync, in order. `waiting` is how many wait.
+   */
+  | { type: 'delivery-failed'; reason: string; waiting: number }
   | { type: 'removed' }
   | { type: 'rotated'; epoch: bigint }
   /** The channel no longer lets this account in. Usually follows a removal. */
@@ -403,24 +459,108 @@ export class Chat {
     );
   }
 
-  /** Create a group (or a DM: a group limited to two people) in a new space. */
+  /**
+   * Create a group (or a DM: a group limited to two people) in a new space.
+   *
+   * Everything is prepared and saved on this device before the space is made, so a failure
+   * after that (the genesis entry not written, or its reply lost) can be finished later by
+   * `finishCreates()` instead of leaving an empty space behind.
+   */
   async createGroup(kind: 'dm' | 'group' = 'group', name?: string): Promise<Group> {
     const cs = await ciphersuite();
-    const space = await this.provider.channel.createSpace(kind);
     const kp = await this.keyPackage();
     const groupId = randomBytes(16);
     const policy = defaultPolicy(kind, this.identity.fingerprint);
     const state = await mls.createGroup(groupId, kp.publicPackage, kp.privatePackage, [encodePolicy(policy)], cs, this.clientConfig());
     const entry: LogEntry = { v: 1, i: 0, prev: '', kind: 'genesis', epoch: '0', gi: await groupInfoBytes(state, cs) };
-    const bytes = jsonBytes(entry);
-    if ((await this.provider.orderedLog.append(space, 0, bytes)) !== 'ok') throw new KeyholdError('conflict', 'new space already has a log');
-    const meta = this.newMeta(b64(groupId), space, 1, await hashEntry(bytes), name);
+    const rec: Creating = { groupId: b64(groupId), kind, name, entry: b64(jsonBytes(entry)), state: b64(mls.encodeGroupState(state)), at: this.now() };
+    const eph = this.opts.device.ephemeral;
+    this.creatingNow.add(rec.groupId);
+    try {
+      await eph.put(CREATING + rec.groupId, jsonBytes(rec));
+      rec.space = await this.provider.channel.createSpace(kind);
+      await eph.put(CREATING + rec.groupId, jsonBytes(rec));
+      const g = await this.finishCreate(rec, state);
+      if (!g) throw new KeyholdError('conflict', 'new space already has a log');
+      if (name) await g.send({ t: 'meta', name });
+      return g;
+    } finally {
+      this.creatingNow.delete(rec.groupId);
+    }
+  }
+
+  /** Creations running in this Chat now (finishCreates leaves them alone). */
+  private creatingNow = new Set<string>();
+
+  /** Write the genesis entry of a prepared creation (or find it already written) and open the group. */
+  private async finishCreate(rec: Creating, state?: mls.ClientState): Promise<Group | undefined> {
+    const key = CREATING + rec.groupId;
+    const bytes = unb64(rec.entry);
+    const hash = await hashEntry(bytes);
+    const log = this.provider.orderedLog;
+    if ((await log.append(rec.space!, 0, bytes)) !== 'ok') {
+      // Maybe ours, from a try whose reply was lost.
+      const [first] = await log.read(rec.space!, 0);
+      if (!first || (await hashEntry(first)) !== hash) {
+        await this.opts.device.ephemeral.delete(key);
+        return undefined;
+      }
+    }
+    const meta = this.newMeta(rec.groupId, rec.space!, 1, hash, rec.name);
     meta.ownEntries.push(0);
-    const g = new Group(this, meta, state);
+    const g = new Group(this, meta, state ?? this.decodeState(unb64(rec.state)));
     await g.persist();
     this.groups.set(meta.groupId, g);
-    if (name) await g.send({ t: 'meta', name });
+    await this.opts.device.ephemeral.delete(key);
     return g;
+  }
+
+  /**
+   * Finish chat creations that failed part way on this device (say, the tab closed or the
+   * network dropped after the space was made). Returns the groups now open. A creation that
+   * never got its space is forgotten. Creations younger than a minute are left alone, as
+   * another tab may still be running them. Errors on one creation don't stop the others.
+   */
+  async finishCreates(): Promise<Group[]> {
+    const eph = this.opts.device.ephemeral;
+    const out: Group[] = [];
+    for (const key of await eph.keys(CREATING)) {
+      const raw = await eph.get(key);
+      if (!raw) continue;
+      const rec = parseJsonBytes<Creating>(raw);
+      if (this.creatingNow.has(rec.groupId) || this.now() - rec.at < 60_000) continue;
+      if (!rec.space) {
+        await eph.delete(key);
+        continue;
+      }
+      try {
+        const g = await this.finishCreate(rec);
+        if (!g) continue;
+        out.push(g);
+        if (rec.name) await g.send({ t: 'meta', name: rec.name }).catch(() => undefined);
+      } catch (e) {
+        const code = (e as KeyholdError).code;
+        if (code === 'forbidden' || code === 'not_found') await eph.delete(key); // the space is gone
+      }
+    }
+    return out;
+  }
+
+  /**
+   * What a space the caller can open holds, for spaces no group here knows:
+   * - 'chat': it has a log; `join` may let us in.
+   * - 'creating': this device is making a chat there; `finishCreates()` completes it.
+   * - 'empty': no log, and not ours to finish. A space we own that stays empty is a creation
+   *   that failed on a device that can't finish it: once it has been empty for a while (another
+   *   device may be creating it right now), the app can treat it as abandoned and delete it.
+   */
+  async inspectSpace(space: SpaceRef): Promise<'chat' | 'creating' | 'empty'> {
+    const eph = this.opts.device.ephemeral;
+    for (const key of await eph.keys(CREATING)) {
+      const raw = await eph.get(key);
+      if (raw && parseJsonBytes<Creating>(raw).space === space) return 'creating';
+    }
+    return (await this.provider.orderedLog.read(space, 0)).length > 0 ? 'chat' : 'empty';
   }
 
   /** Start a DM with someone: a two-person group plus an invite. */
@@ -452,16 +592,18 @@ export class Chat {
 
   /**
    * Pick up invites: accept channel grants from the inbox, then join every space that
-   * has a ticket (or a Welcome) for this device. Returns the groups joined.
+   * has a ticket (or a Welcome) for this device. Returns the groups joined (and any of our own
+   * creations `finishCreates` completed).
    */
   async acceptInvites(): Promise<Group[]> {
     const p = this.provider;
+    const finished = await this.finishCreates(); // our own creations that failed part way
     for (const n of await p.inviteInbox.list()) {
       await p.channel.acceptGrant(n.pointer);
       await p.inviteInbox.delete(n.id);
     }
     const known = new Set([...this.groups.values()].map((g) => g.space));
-    const joined: Group[] = [];
+    const joined: Group[] = [...finished];
     for (const space of await p.channel.listSpaces()) {
       if (known.has(space)) continue;
       const g = await this.join(space);
@@ -984,6 +1126,8 @@ export class Group {
     // Group state holds epoch and ratchet secrets: box 2, overwritten (and the old copy wiped) each change.
     await dev.ephemeral.put(`chat/state/${this.meta.groupId}`, mls.encodeGroupState(this.state));
     this.meta.ownMail = this.meta.ownMail.slice(-500);
+    if (this.meta.ownHashes) this.meta.ownHashes = this.meta.ownHashes.slice(-200);
+    if (this.meta.seenHashes) this.meta.seenHashes = this.meta.seenHashes.slice(-200);
     await dev.keystore.put(`chat/group/${this.meta.groupId}`, jsonBytes(this.meta));
   }
 
@@ -1041,8 +1185,8 @@ export class Group {
     this.requireActive();
     if (this.rotationDue()) await this.commit([]);
     const cs = await ciphersuite();
-    const messages: AppMessage[] = [];
-    const wires: Uint8Array[] = [];
+    const mailbox = this.chat.provider.mailbox;
+    const batch: OutboxItem[] = [];
     for (const content of contents) {
       // Strictly increasing times, so a burst keeps its order wherever it is sorted by time.
       const ts = Math.max(this.chat.now(), this.lastSentTs + 1);
@@ -1052,26 +1196,115 @@ export class Group {
       this.state = res.newState;
       this.meta.sentSinceUpdate++;
       res.consumed.forEach(mls.zeroOutUint8Array);
-      messages.push(message);
-      wires.push(encodeMsg({ wireformat: 'mls_private_message', version: 'mls10', privateMessage: res.privateMessage }));
+      const wire = encodeMsg({ wireformat: 'mls_private_message', version: 'mls10', privateMessage: res.privateMessage });
+      batch.push({ message, wire: b64(wire), hash: await hashEntry(wire), id: mailbox.newId?.(), epoch: String(this.epoch) });
     }
     // Persist the advanced ratchet BEFORE the ciphertext leaves: a crash must never lead to a
-    // second message with the same generation (nonce reuse).
+    // second message with the same generation (nonce reuse). The ciphertext (and its mail id) is
+    // saved with it, so a retry posts the very same message and our own copy is never foreign.
+    this.meta.outbox = [...(this.meta.outbox ?? []), ...batch];
+    this.meta.ownHashes = [...(this.meta.ownHashes ?? []), ...batch.map((b) => b.hash)];
     await this.persist();
+    await this.postOutbox(batch);
+    return batch.map((b) => b.message);
+  }
+
+  /** Post saved ciphertexts (all or none where the provider can batch), then deliver them as ours. */
+  private async postOutbox(items: OutboxItem[]) {
     const mailbox = this.chat.provider.mailbox;
-    let ids: string[];
-    if (wires.length > 1 && mailbox.postMany) ids = await mailbox.postMany(this.meta.space, wires);
-    else {
-      ids = [];
-      for (const w of wires) ids.push(await mailbox.post(this.meta.space, w));
+    const space = this.meta.space;
+    const posted: OutboxItem[] = [];
+    try {
+      if (items.length > 1 && mailbox.postMany) {
+        const ids = await mailbox.postMany(space, items.map((i) => unb64(i.wire)), items.every((i) => i.id) ? { ids: items.map((i) => i.id!) } : undefined);
+        await this.landed(items, ids);
+        posted.push(...items);
+      } else {
+        for (const item of items) {
+          const id = await mailbox.post(space, unb64(item.wire), item.id ? { id: item.id } : undefined);
+          await this.landed([item], [id]);
+          posted.push(item);
+        }
+      }
+    } catch (e) {
+      if (typeof e === 'object' && e !== null) unsentByError.set(e, items.filter((i) => !posted.includes(i)).map((i) => i.message));
+      throw e;
     }
-    this.meta.ownMail.push(...ids);
+    await this.redeliver(this.buffered);
     await this.persist();
+  }
+
+  /** These saved messages are in the mailbox (under `ids`): ours, to hand to the app. */
+  private async landed(items: OutboxItem[], ids: string[]) {
+    const done = new Set(items.map((i) => i.hash));
+    this.meta.outbox = (this.meta.outbox ?? []).filter((o) => !done.has(o.hash));
+    if (!this.meta.outbox.length) delete this.meta.outbox;
+    this.meta.ownMail.push(...ids);
     const me = this.chat.identity;
-    for (const message of messages) {
-      await this.chat.opts.onMessage?.(this, { message, from: { fingerprint: me.fingerprint, address: me.address, deviceId: me.deviceId }, epoch: this.epoch });
+    const from = { fingerprint: me.fingerprint, address: me.address, deviceId: me.deviceId };
+    this.meta.undelivered = [...(this.meta.undelivered ?? []), ...items.map((i) => ({ message: i.message, from, epoch: i.epoch, own: true }))];
+    // Saved before onMessage runs: if the tab closes now, the next sync hands them over.
+    await this.persist();
+  }
+
+  /** Messages this device encrypted and saved, not yet known to be posted (oldest first). */
+  unsent(): AppMessage[] {
+    return (this.meta.outbox ?? []).map((o) => o.message);
+  }
+
+  /**
+   * Post again what a failed send left (all of it, or only `messageId`): the same ciphertext,
+   * and the same mail id where the provider has `mailbox.newId`, so a message whose first post
+   * did land is not sent twice. A sync first looks for copies that landed. Resolves with the
+   * messages that are now sent; throws (see `unsentMessages`) if posting fails again.
+   */
+  resend(messageId?: string): Promise<AppMessage[]> {
+    return this.exclusive(async () => {
+      const want = this.unsent().filter((m) => messageId === undefined || m.id === messageId);
+      if (!want.length) return [];
+      this.requireActive();
+      await this.pull(); // finds copies that landed, and moves them out of the outbox
+      const ids = new Set(want.map((m) => m.id));
+      const items = (this.meta.outbox ?? []).filter((o) => ids.has(o.message.id));
+      if (items.length) await this.postOutbox(items);
+      return want;
+    });
+  }
+
+  /** Stop trying to send this message (it may still have landed, if a reply was lost). */
+  discardUnsent(messageId: string): Promise<void> {
+    return this.exclusive(async () => {
+      const left = (this.meta.outbox ?? []).filter((o) => o.message.id !== messageId);
+      if (left.length === (this.meta.outbox ?? []).length) return;
+      if (left.length) this.meta.outbox = left;
+      else delete this.meta.outbox;
+      await this.persist();
+    });
+  }
+
+  /**
+   * Hand decrypted messages to `onMessage`, oldest first. If it throws, this one and the rest
+   * stay for the next sync (they are saved with the group state, whose keys for them are spent).
+   */
+  private async redeliver(out: SyncResult): Promise<void> {
+    const list = this.meta.undelivered;
+    if (!list?.length) return;
+    let n = 0;
+    try {
+      for (const u of list) {
+        const m: ReceivedMessage = { message: u.message, from: u.from, epoch: BigInt(u.epoch) };
+        await this.chat.opts.onMessage?.(this, m);
+        n++;
+        if (!u.own) out.messages.push(m);
+      }
+    } catch (e) {
+      if (!out.events.some((ev) => ev.type === 'delivery-failed')) out.events.push({ type: 'delivery-failed', reason: (e as Error)?.message ?? String(e), waiting: list.length - n });
     }
-    return messages;
+    const rest = list.slice(n);
+    // An app that never takes them must not grow this forever (it is saved on every change).
+    for (const d of rest.splice(0, Math.max(0, rest.length - 1000))) out.events.push({ type: 'undecryptable', id: d.message.id, reason: 'the app did not take it' });
+    if (rest.length) this.meta.undelivered = rest;
+    else delete this.meta.undelivered;
   }
   private lastSentTs = 0;
 
@@ -1355,7 +1588,7 @@ export class Group {
     }
     const mine = leaves(this.state).filter((l) => l.root === me && l.leafIndex !== this.myLeaf);
     if (mine.length) await this.commit(mine.map((t) => ({ proposalType: 'remove', remove: { removed: t.leafIndex } }) as mls.Proposal));
-    if (others.length > 0) await this.propose({ proposalType: 'remove', remove: { removed: this.myLeaf } });
+    if (others.length > 0) await this.propose({ proposalType: 'remove', remove: { removed: this.myLeaf } }, true);
     await this.forget();
   }
 
@@ -1489,17 +1722,26 @@ export class Group {
     throw new KeyholdError('conflict', 'the group kept changing; try again');
   }
 
-  private async propose(p: mls.Proposal) {
+  /** `leaving`: this proposal removes us, so once it lands the group is forgotten (also when found after a lost reply). */
+  private async propose(p: mls.Proposal, leaving = false) {
     const cs = await ciphersuite();
     for (let attempt = 0; attempt < 6; attempt++) {
       if (attempt > 0) await this.syncInner(false);
       const res = await mls.createProposal(this.state, false, p, cs);
       const entry: LogEntry = { v: 1, i: this.meta.logNext, prev: this.meta.lastHash, kind: 'proposal', epoch: String(this.epoch), mls: b64(encodeMsg(res.message)) };
       const bytes = jsonBytes(entry);
-      if ((await this.chat.provider.orderedLog.append(this.meta.space, entry.i, bytes)) === 'ok') {
+      // As in commit: keep the would-be state until we know whether the append landed, so a
+      // lost reply doesn't make the next sync read our own proposal as someone else's.
+      const pendingKey = `chat/pending/${this.meta.groupId}`;
+      const dev = this.chat.opts.device;
+      await dev.ephemeral.put(pendingKey, jsonBytes({ hash: await hashEntry(bytes), state: b64(mls.encodeGroupState(res.newState)), ...(leaving ? { leaving } : {}) }));
+      const appended = await this.chat.provider.orderedLog.append(this.meta.space, entry.i, bytes);
+      if (appended !== 'ok') await dev.ephemeral.delete(pendingKey);
+      if (appended === 'ok') {
         this.state = res.newState;
         await this.recordEntry(bytes, true);
         await this.persist();
+        await dev.ephemeral.delete(pendingKey);
         return;
       }
     }
@@ -1550,8 +1792,21 @@ export class Group {
     }
     this.meta.accessLost = false;
     const own = new Set(this.meta.ownMail);
+    const ownHashes = new Set([...(this.meta.ownHashes ?? []), ...(this.meta.outbox ?? []).map((o) => o.hash)]);
+    const seen = new Set(this.meta.seenHashes ?? []);
     for (const item of mail.items) {
       if (own.has(item.id)) continue;
+      const hash = await hashEntry(item.data);
+      if (ownHashes.has(hash)) {
+        // Ours, though the reply to the post was lost: it landed, so it is sent.
+        const sent = (this.meta.outbox ?? []).filter((o) => o.hash === hash);
+        if (sent.length) await this.landed(sent, [item.id]);
+        else this.meta.ownMail.push(item.id);
+        continue;
+      }
+      if (seen.has(hash)) continue; // the same ciphertext posted twice (a retried send): open it once
+      seen.add(hash);
+      (this.meta.seenHashes ??= []).push(hash);
       let epoch = '0';
       try {
         const m = decodeMsg(item.data);
@@ -1577,13 +1832,19 @@ export class Group {
     }
     const pendingKey = `chat/pending/${this.meta.groupId}`;
     const pendingRaw = await this.chat.opts.device.ephemeral.get(pendingKey);
-    const pendingCommit = pendingRaw ? parseJsonBytes<{ hash: string; state: string }>(pendingRaw) : undefined;
+    const pendingCommit = pendingRaw ? parseJsonBytes<{ hash: string; state: string; leaving?: boolean }>(pendingRaw) : undefined;
     for (const bytes of raw.slice(this.meta.logNext > 0 ? 1 : 0)) {
       if (pendingCommit && (await hashEntry(bytes)) === pendingCommit.hash) {
         // Our own commit from before a crash: adopt the state we prepared for it.
         this.state = this.chat.decodeState(unb64(pendingCommit.state));
         await this.recordEntry(bytes, true);
         await this.chat.opts.device.ephemeral.delete(pendingKey);
+        if (pendingCommit.leaving) {
+          // Our leave landed before the reply was lost: finish leaving.
+          await this.forget();
+          out.events.push({ type: 'removed' });
+          return out;
+        }
         continue;
       }
       let e: LogEntry | undefined;
@@ -1623,14 +1884,15 @@ export class Group {
       try {
         const m = await this.openApplication(unb64(item.data));
         if (m) {
-          out.messages.push(m);
           await this.handleSystem(m);
-          await this.chat.opts.onMessage?.(this, m);
+          // Kept with the state that spent its key, so an app error can't lose it (see redeliver).
+          (this.meta.undelivered ??= []).push({ message: m.message, from: m.from, epoch: String(m.epoch) });
         }
       } catch (e) {
         out.events.push({ type: 'undecryptable', id: item.id, reason: (e as Error).message });
       }
     }
+    await this.redeliver(out);
     // Messages for epochs that never arrive (or junk) must not pile up forever.
     const MAX_PENDING = 2000;
     for (const dropped of keep.splice(0, Math.max(0, keep.length - MAX_PENDING))) {

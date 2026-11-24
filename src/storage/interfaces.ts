@@ -109,15 +109,26 @@ export interface MailboxItem {
   data: Bytes;
 }
 
-/** Box 6. Append in any order. The cursor is opaque and provider-defined. */
+/**
+ * Box 6. Append in any order. The cursor is opaque and provider-defined.
+ *
+ * Retries (optional, with `newId`): a caller that lost the reply to a post doesn't know whether
+ * it landed. It takes an id from `newId()` before the first try and passes the same id on every
+ * try, so the item lands once. Posting with an id that already holds the same bytes is a
+ * success; the same id with different bytes is a 'conflict' error. The provider may still store
+ * the item under another id (say, when the id is too old for its listing order) and returns the
+ * id it used: callers always keep the returned id. Providers without `newId` ignore `options`.
+ */
 export interface Mailbox {
-  post(space: SpaceRef, data: Bytes): Promise<string>;
+  /** Optional: a fresh item id for a later `post` / `postMany`, made locally (no network). */
+  newId?(): string;
+  post(space: SpaceRef, data: Bytes, options?: { id?: string }): Promise<string>;
   /**
    * Optional: post several items in one write, all or none, and return their ids in order.
    * Readers see them as ordinary items, listed in the order given. Without it, callers post
-   * one at a time.
+   * one at a time. `options.ids` (one per item, from `newId`) works as for `post`.
    */
-  postMany?(space: SpaceRef, data: Bytes[]): Promise<string[]>;
+  postMany?(space: SpaceRef, data: Bytes[], options?: { ids?: string[] }): Promise<string[]>;
   list(space: SpaceRef, cursor?: string): Promise<{ items: MailboxItem[]; cursor: string }>;
 }
 
