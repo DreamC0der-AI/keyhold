@@ -27,6 +27,15 @@ const DAY = 86_400_000;
 const rid = () => toHex(randomBytes(12));
 const copy = (b: Bytes) => own(b);
 const forbidden = (what: string) => new KeyholdError('forbidden', what);
+const sameBytes = (a: Bytes, b: Bytes) => a.length === b.length && a.every((x, i) => x === b[i]);
+
+/** Add a mail item; an id that is already there with the same bytes is a no-op. False if it holds other bytes. */
+function putMail(s: { mail: MailboxItem[] }, id: string, data: Bytes): boolean {
+  const have = s.mail.find((m) => m.id === id);
+  if (have) return sameBytes(have.data, data);
+  s.mail.push({ id, data: copy(data) });
+  return true;
+}
 
 interface Space {
   ref: SpaceRef;
@@ -243,18 +252,24 @@ function memorySession(w: MemoryWorld, self: Address): StorageProvider {
       },
     },
     mailbox: {
-      async post(ref, data) {
+      newId() {
+        return rid();
+      },
+      async post(ref, data, options) {
         w.count('mailbox.post');
-        const id = rid();
-        space(ref).mail.push({ id, data: copy(data) });
+        const s = space(ref);
+        const id = options?.id ?? rid();
+        if (!putMail(s, id, data)) throw new KeyholdError('conflict', 'another item has this id');
         return id;
       },
-      async postMany(ref, data) {
+      async postMany(ref, data, options) {
         w.count('mailbox.postMany');
         const s = space(ref);
-        const items = data.map((d) => ({ id: rid(), data: copy(d) }));
-        s.mail.push(...items);
-        return items.map((i) => i.id);
+        const ids = data.map((_, i) => options?.ids?.[i] ?? rid());
+        // All or none: check every id first.
+        if (ids.some((id, i) => s.mail.some((m) => m.id === id && !sameBytes(m.data, data[i]!)))) throw new KeyholdError('conflict', 'another item has this id');
+        ids.forEach((id, i) => putMail(s, id, data[i]!));
+        return ids;
       },
       async list(ref, cursor) {
         const s = space(ref);
