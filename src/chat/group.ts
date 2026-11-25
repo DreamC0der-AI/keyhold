@@ -173,6 +173,11 @@ interface GroupMeta {
   unjoinedSince?: Record<string, number>;
   /** Our messages, encrypted and saved, not yet known to be posted. A retry posts the same bytes. */
   outbox?: OutboxItem[];
+  /**
+   * Messages sent without a sync first (`sendFreshMs`), with the epoch they were encrypted in.
+   * If a later sync finds the group had already moved on, they are sent again in the new epoch.
+   */
+  fastSent?: { message: AppMessage; epoch: string; at: number; tries?: number }[];
   /** Hashes of our recent ciphertexts: our own mail even when we never learnt its id. */
   ownHashes?: string[];
   /** Hashes of recent mail from others: a copy posted twice is opened once. */
@@ -268,6 +273,9 @@ export const DEFAULT_PREKEYS: PreKeyPolicy = { rotateMs: 7 * DAY, keepMs: 7 * DA
  * every member agrees who is only "added".
  */
 export const PREKEY_EXTENSION = 0xf0a2;
+/** A send skips its sync only if the epoch has been the same for this many `sendFreshMs`. */
+const EPOCH_SETTLE = 4;
+const MAX_FAST_SENT = 50;
 
 interface PreKeyInfo {
   ref: string;
@@ -290,6 +298,12 @@ export interface ChatOptions {
   directoryMaxAgeMs?: number;
   /** Pre-key rotation (build option preKeys). */
   preKeys?: PreKeyPolicy;
+  /**
+   * Send without syncing first when a sync of this group finished less than this long ago
+   * (0, the default: always sync first). For apps that sync a chat every few seconds anyway,
+   * on channels where each round trip is slow. See `Group.send`.
+   */
+  sendFreshMs?: number;
   /** Called with every decrypted message (for example, the history backup). */
   onMessage?: (group: Group, m: ReceivedMessage) => Promise<void> | void;
   now?: () => number;
@@ -420,6 +434,7 @@ export class Chat {
       preKeys: DEFAULT_PREKEYS,
       retainEpochs: 4,
       directoryMaxAgeMs: 60 * 60 * 1000,
+      sendFreshMs: 0,
       now: Date.now,
       ...(Object.fromEntries(Object.entries(opts).filter(([, v]) => v !== undefined)) as ChatOptions),
     };
@@ -760,6 +775,8 @@ export class Chat {
       if (t) meta.usedNonces.push(t.nonce);
       // Messages from before we joined can't be read (MLS has no pre-join history); skip them.
       meta.mailCursor = (await p.mailbox.list(space)).cursor;
+      // Also one posted after this, by someone who had not seen us join yet: not an error.
+      meta.joinedEpoch = String(newState.groupContext.epoch);
       const g = new Group(this, meta, newState);
       await g.persist();
       this.groups.set(meta.groupId, g);
@@ -1224,6 +1241,15 @@ export class Group {
   private lastRequests = 0;
   /** Messages and events found by internal syncs (before a send or commit), returned by the next sync(). */
   private buffered: SyncResult = { messages: [], events: [] };
+  /** When the last complete sync of this group started (this session only). */
+  private pulledAt = -Infinity;
+  /** When this device last saw the group change epoch (this session only), and that epoch. */
+  private epochChangedAt = -Infinity;
+  private epochSeen?: bigint;
+  private noteEpoch() {
+    if (this.epochSeen !== undefined && this.epochSeen !== this.epoch) this.epochChangedAt = this.chat.now();
+    this.epochSeen = this.epoch;
+  }
 
   constructor(
     readonly chat: Chat,
@@ -1331,17 +1357,51 @@ export class Group {
   private async sendNow(contents: AppContent[]): Promise<AppMessage[]> {
     this.requireActive();
     // Never encrypt for a stale epoch: members who joined or rotated since couldn't read it.
-    await this.pull();
-    this.requireActive();
-    if (this.rotationDue()) await this.commit([]);
-    const cs = await ciphersuite();
-    const mailbox = this.chat.provider.mailbox;
-    const batch: OutboxItem[] = [];
-    for (const content of contents) {
+    // A sync that finished a moment ago is as good (see syncedJustNow), and saves the round trips.
+    const fast = this.syncedJustNow();
+    if (!fast) {
+      await this.pull();
+      this.requireActive();
+      if (this.rotationDue()) await this.commit([]);
+    }
+    const messages = contents.map((content) => {
       // Strictly increasing times, so a burst keeps its order wherever it is sorted by time.
       const ts = Math.max(this.chat.now(), this.lastSentTs + 1);
       this.lastSentTs = ts;
-      const message = { v: 1, id: newMessageId(), ts, ...content } as AppMessage;
+      return { v: 1, id: newMessageId(), ts, ...content } as AppMessage;
+    });
+    return this.encryptAndPost(messages, fast);
+  }
+
+  /**
+   * May a send skip its sync? Only when everything this device knows says the group is quiet:
+   * a full sync finished within `sendFreshMs`, the epoch has been the same for a while (people
+   * joining or being removed come in bursts, and a removed member must not get one more
+   * message), and nothing is waiting for a sync to sort out. What this can't know, a change that
+   * landed since that sync, is caught afterwards (repostStale).
+   */
+  private syncedJustNow(): boolean {
+    const fresh = this.chat.opts.sendFreshMs;
+    if (!(fresh > 0)) return false;
+    this.noteEpoch();
+    const now = this.chat.now();
+    const age = now - this.pulledAt;
+    if (!(age >= 0 && age < fresh)) return false; // also a clock that jumped back
+    if (now - this.epochChangedAt < fresh * EPOCH_SETTLE) return false;
+    if (this.rotationDue() || this.meta.needsHeal || this.meta.rejoin || this.meta.freshLeaf || this.meta.accessLost) return false;
+    if (Object.keys(this.state.unappliedProposals).length > 0) return false;
+    if (this.meta.outbox?.length) return false; // an earlier send is unsettled: a sync sorts it out
+    if (this.meta.pending.some((m) => BigInt(m.epoch) > this.epoch)) return false; // mail from an epoch we haven't reached
+    if (this.meta.fastSent?.some((f) => BigInt(f.epoch) < this.epoch)) return false; // a repost is due
+    return true;
+  }
+
+  /** Encrypt these messages in order, each with its own key, save them, then post them in one write. */
+  private async encryptAndPost(messages: AppMessage[], fast: boolean): Promise<AppMessage[]> {
+    const cs = await ciphersuite();
+    const mailbox = this.chat.provider.mailbox;
+    const batch: OutboxItem[] = [];
+    for (const message of messages) {
       const res = await mls.createApplicationMessage(this.state, encodeAppMessage(message), cs);
       this.state = res.newState;
       this.meta.sentSinceUpdate++;
@@ -1354,9 +1414,46 @@ export class Group {
     // saved with it, so a retry posts the very same message and our own copy is never foreign.
     this.meta.outbox = [...(this.meta.outbox ?? []), ...batch];
     this.meta.ownHashes = [...(this.meta.ownHashes ?? []), ...batch.map((b) => b.hash)];
+    if (fast) {
+      const at = this.chat.now();
+      this.meta.fastSent = [...(this.meta.fastSent ?? []), ...batch.map((b) => ({ message: b.message, epoch: b.epoch, at }))].slice(-MAX_FAST_SENT);
+    }
     await this.persist();
     await this.postOutbox(batch);
     return batch.map((b) => b.message);
+  }
+
+  /**
+   * After a sync: what was sent without one first (fastSent) and turned out to be encrypted in an
+   * epoch the group had already left is sent again in the current epoch, with the same message
+   * id. Someone who joined in between gets it; everyone else already has it and, delivery being
+   * at least once, keeps the copy they have. The rest is settled once it has been watched for a
+   * while (a commit can show up late on a channel whose reads lag).
+   */
+  private async repostStale(): Promise<void> {
+    const list = this.meta.fastSent;
+    if (!list?.length) return;
+    const now = this.chat.now();
+    const stale = list.filter((f) => BigInt(f.epoch) < this.epoch);
+    const watch = list.filter((f) => BigInt(f.epoch) >= this.epoch && now - f.at < this.chat.opts.sendFreshMs * EPOCH_SETTLE);
+    const set = (l: NonNullable<GroupMeta['fastSent']>) => {
+      if (l.length) this.meta.fastSent = l;
+      else delete this.meta.fastSent;
+    };
+    set(watch);
+    if (!stale.length) return;
+    try {
+      await this.encryptAndPost(stale.map((f) => f.message), false);
+    } catch {
+      // The originals are sent; a copy that did not go out is not an unsent message. Try again
+      // at the next sync, a few times.
+      const ids = new Set(stale.map((f) => f.message.id));
+      const left = (this.meta.outbox ?? []).filter((o) => !ids.has(o.message.id));
+      if (left.length) this.meta.outbox = left;
+      else delete this.meta.outbox;
+      set([...stale.map((f) => ({ ...f, tries: (f.tries ?? 0) + 1 })).filter((f) => f.tries < 3), ...watch]);
+      await this.persist();
+    }
   }
 
   /** Post saved ciphertexts (all or none where the provider can batch), then deliver them as ours. */
@@ -1855,6 +1952,13 @@ export class Group {
       if (appended !== 'ok') await dev.ephemeral.delete(pendingKey);
       if (appended === 'ok') {
         const before = this.members();
+        // Our entry took the next place in the log: nobody changed the group before it, so what
+        // was sent fast in the epoch it was built on was in the newest epoch after all.
+        const builtOn = String(this.epoch);
+        if (this.meta.fastSent) {
+          this.meta.fastSent = this.meta.fastSent.filter((f) => f.epoch !== builtOn);
+          if (!this.meta.fastSent.length) delete this.meta.fastSent;
+        }
         this.state = res.newState;
         res.consumed.forEach(mls.zeroOutUint8Array);
         await this.recordEntry(bytes, true);
@@ -1931,6 +2035,7 @@ export class Group {
 
     // The log is read while the mailbox is listed (they don't depend on each other: two round
     // trips at once, not one after the other), but applied after it, as before.
+    const startedAt = this.chat.now();
     const from = Math.max(0, this.meta.logNext - 1);
     const logRead = p.orderedLog.read(space, from);
     logRead.catch(() => undefined); // handled where it is awaited; not if the mailbox fails first
@@ -2024,7 +2129,16 @@ export class Group {
     if (pendingCommit) await this.chat.opts.device.ephemeral.delete(pendingKey); // it never landed
     await this.persist();
 
-    if (withAutomation && this.active) await this.automate(out);
+    if (withAutomation && this.active) {
+      // Before our own housekeeping commits: only what others did makes a fast send stale.
+      await this.repostStale();
+      if (this.active) await this.automate(out);
+    }
+    if (this.active) {
+      this.noteEpoch();
+      // The group as it was when this sync started, at least: what a send may rely on for a moment.
+      this.pulledAt = startedAt;
+    }
     return out;
   }
 
