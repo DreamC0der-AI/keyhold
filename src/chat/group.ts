@@ -326,12 +326,39 @@ export interface ReceivedMessage {
   epoch: bigint;
 }
 
+/** The person whose app committed (or proposed) a removal. */
+export interface Remover {
+  fingerprint: string;
+  address: Address;
+}
+
+/**
+ * Who removed each person that these removes take out (all of their devices), keyed by the
+ * removed person's fingerprint. Not in the map: someone whose own device proposed it (a leave),
+ * and someone who keeps other devices (one device revoked or replaced).
+ */
+function removersOf(members: MemberLeaf[], removes: { removed: number; sender: number | undefined }[]) {
+  const out = new Map<string, Remover>();
+  const gone = new Set(removes.map((r) => r.removed));
+  for (const r of removes) {
+    const target = members.find((l) => l.leafIndex === r.removed);
+    const sender = r.sender === undefined ? undefined : members.find((l) => l.leafIndex === r.sender);
+    if (!target || !sender || sender.root === target.root) continue;
+    if (members.some((l) => l.root === target.root && !gone.has(l.leafIndex))) continue;
+    out.set(target.root, { fingerprint: sender.root, address: sender.address });
+  }
+  return out;
+}
+
 export type GroupEvent =
   /** Someone was added with pre-keys; they can read what is sent from now on once they join. */
   | { type: 'added'; fingerprint: string; address: Address }
   | { type: 'joined'; fingerprint: string; address: Address }
-  /** `pending`: they were added but never joined (declined, expired, or removed before joining). */
-  | { type: 'left'; fingerprint: string; address: Address; pending?: boolean }
+  /**
+   * `pending`: they were added but never joined (declined, expired, or removed before joining).
+   * `by`: someone else removed them (an admin); absent when they left on their own.
+   */
+  | { type: 'left'; fingerprint: string; address: Address; pending?: boolean; by?: Remover }
   | { type: 'policy'; policy: GroupPolicy }
   | { type: 'rejected'; index: number; reason: string }
   | { type: 'undecryptable'; id: string; reason: string }
@@ -346,7 +373,8 @@ export type GroupEvent =
    * A dropped LAST message of an epoch can't be noticed this way.
    */
   | { type: 'gap'; from: ReceivedMessage['from']; epoch: bigint; missing: number }
-  | { type: 'removed' }
+  /** We are out of the group. `by`: who removed us, when we can tell (absent when we left). */
+  | { type: 'removed'; by?: Remover }
   | { type: 'rotated'; epoch: bigint }
   /** The channel no longer lets this account in. Usually follows a removal. */
   | { type: 'access-lost' };
@@ -1972,6 +2000,11 @@ export class Group {
       if (appended !== 'ok') await dev.ephemeral.delete(pendingKey);
       if (appended === 'ok') {
         const before = this.members();
+        // Proposals waiting in the state go into the commit too (a leave someone proposed).
+        const removers = removersOf(leaves(this.state), [
+          ...Object.values(this.state.unappliedProposals).flatMap((p) => (p.proposal.proposalType === 'remove' ? [{ removed: p.proposal.remove.removed, sender: p.senderLeafIndex }] : [])),
+          ...proposals.flatMap((p) => (p.proposalType === 'remove' ? [{ removed: p.remove.removed, sender: this.myLeaf as number | undefined }] : [])),
+        ]);
         // Our entry took the next place in the log: nobody changed the group before it, so what
         // was sent fast in the epoch it was built on was in the newest epoch after all.
         const builtOn = String(this.epoch);
@@ -1982,7 +2015,7 @@ export class Group {
         this.state = res.newState;
         res.consumed.forEach(mls.zeroOutUint8Array);
         await this.recordEntry(bytes, true);
-        this.diffMembers(before, this.buffered);
+        this.diffMembers(before, this.buffered, removers);
         this.meta.sentSinceUpdate = 0;
         this.meta.lastUpdateAt = this.chat.now();
         this.meta.needsHeal = false;
@@ -2323,10 +2356,12 @@ export class Group {
     let verdict: { ok: boolean; reason?: string } = { ok: true };
     const policy = this.policy;
     const removed = new Set<number>();
+    const removes: { removed: number; sender: number | undefined }[] = [];
     const callback: mls.IncomingMessageCallback = (incoming) => {
       const proposals = incoming.kind === 'commit' ? incoming.proposals : [incoming.proposal];
       const summaries = proposals.map(summarize);
       for (const s of summaries) if (s.type === 'remove') removed.add(s.removed);
+      if (incoming.kind === 'commit') for (const s of summaries) if (s.type === 'remove') removes.push({ removed: s.removed, sender: s.sender });
       if (incoming.kind === 'proposal') {
         const s = summaries[0]!;
         // Standalone proposals: only key updates and removes (leaving) are allowed.
@@ -2365,19 +2400,22 @@ export class Group {
       this.meta.rejoin = undefined;
     }
 
+    const removers = removersOf(members, removes);
     if (this.state.groupActiveState.kind !== 'active') {
-      out.events.push({ type: 'removed' });
+      const by = removers.get(this.chat.identity.fingerprint);
+      out.events.push(by ? { type: 'removed', by } : { type: 'removed' });
       await this.forget();
       return;
     }
     if (e.kind !== 'commit') return;
     const after = this.members();
-    this.diffMembers(before, out);
+    this.diffMembers(before, out, removers);
     const np = this.policy;
     if (JSON.stringify(np) !== JSON.stringify(policy)) out.events.push({ type: 'policy', policy: np });
   }
 
-  private diffMembers(before: Member[], out: SyncResult) {
+  /** `removers`: who removed whom in this commit (see removersOf); anyone else gone left. */
+  private diffMembers(before: Member[], out: SyncResult, removers?: Map<string, Remover>) {
     const after = this.members();
     for (const m of after) {
       const b = before.find((x) => x.fingerprint === m.fingerprint);
@@ -2386,7 +2424,8 @@ export class Group {
     }
     for (const b of before) {
       if (after.some((m) => m.fingerprint === b.fingerprint)) continue;
-      out.events.push(b.pending ? { type: 'left', fingerprint: b.fingerprint, address: b.address, pending: true } : { type: 'left', fingerprint: b.fingerprint, address: b.address });
+      const by = removers?.get(b.fingerprint);
+      out.events.push({ type: 'left', fingerprint: b.fingerprint, address: b.address, ...(b.pending ? { pending: true } : {}), ...(by ? { by } : {}) });
     }
   }
 
