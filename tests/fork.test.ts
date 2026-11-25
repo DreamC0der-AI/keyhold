@@ -136,4 +136,44 @@ describe('a device in the tree twice', () => {
     const joined = await laptop.chat.join(g.space);
     expect(joined).toBeTruthy();
   });
+  it('a device that joined twice: the admin drops the twin it never heard from, so new devices can join', async () => {
+    const w = new MemoryWorld({ claimOnce: false });
+    const opts: TestUserOptions = { build: { preKeys: true } };
+    const bob = await makeUser(w.session('mem:bob'), 'mem:bob', opts);
+    const carol = await makeUser(w.session('mem:carol'), 'mem:carol', opts);
+    const g = await bob.chat.createGroup('dm');
+    await g.invite(carol.address);
+    const [gc] = await carol.chat.acceptInvites();
+    await g.sync();
+
+    // An older app joined a second time with the same device, next to its first leaf.
+    const cs = await ciphersuite();
+    const { unb64, b64, jsonBytes } = await import('../src/util/codec.js');
+    const { sha256 } = await import('../src/util/bytes.js');
+    const raw = await carol.provider.orderedLog.read(g.space, 0);
+    const last = JSON.parse(new TextDecoder().decode(raw[raw.length - 1]!));
+    const giMsg = mls.decodeMlsMessage(unb64(last.gi), 0)![0];
+    if (giMsg.wireformat !== 'mls_group_info') throw new Error('gi');
+    const kp = await carol.chat.keyPackage();
+    const { publicMessage, newState } = await mls.joinGroupExternal(giMsg.groupInfo, kp.publicPackage, kp.privatePackage, false, cs, undefined, carol.chat.clientConfig(), new Uint8Array());
+    const gi2 = await mls.createGroupInfoWithExternalPubAndRatchetTree(newState, [], cs);
+    const entry = { v: 1, i: raw.length, prev: b64(await sha256(raw[raw.length - 1]!)), kind: 'commit', epoch: String(newState.groupContext.epoch), mls: b64(mls.encodeMlsMessage({ wireformat: 'mls_public_message', version: 'mls10', publicMessage })), gi: b64(mls.encodeMlsMessage({ wireformat: 'mls_group_info', version: 'mls10', groupInfo: gi2 })) };
+    expect(await carol.provider.orderedLog.append(g.space, raw.length, jsonBytes(entry))).toBe('ok');
+    await g.sync();
+    expect(g.members().find((m) => m.address === carol.address)!.devices).toHaveLength(2);
+    // carol's app keeps using its first leaf (the twin's state was lost): it rejoins onto the new
+    // epoch, and what it sends tells bob which leaf is live.
+    await gc!.sync();
+    await gc!.sync();
+    await gc!.send({ t: 'text', body: 'from the live leaf' });
+    expect(texts(await g.sync())).toContain('from the live leaf');
+    await g.sync();
+    expect(g.members().find((m) => m.address === carol.address)!.devices).toHaveLength(1);
+    expect(texts(await gc!.sync())).toEqual([]);
+    await gc!.send({ t: 'text', body: 'still here' });
+    expect(texts(await g.sync())).toContain('still here');
+
+    const laptop = await addDevice(bob, opts);
+    expect(await laptop.chat.join(g.space)).toBeTruthy();
+  });
 });

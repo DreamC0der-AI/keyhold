@@ -2287,6 +2287,7 @@ export class Group {
       out.events.push({ type: 'rotated', epoch: this.epoch });
     }
     await this.removeUnjoined();
+    await this.removeTwins();
     // Only admins issue tickets, so only they answer join requests: on every sync while this
     // device has an address-only invite out, else every 10 minutes (for invites from my other devices).
     const now = this.chat.now();
@@ -2390,6 +2391,48 @@ export class Group {
    * Devices added with pre-keys that never joined: removed by an admin after the join deadline,
    * or earlier when `gone` says they no longer can (their channel invitation ended).
    */
+  /**
+   * One device in the tree twice, both leaves joined (an older app joined a chat twice at once).
+   * Anyone joining then fails ("signature keys not unique"). The device itself removes the twin it
+   * doesn't use; an admin removes the twins it hasn't heard from, keeping the leaf that last sent.
+   * With nothing heard from either, the admin can't tell which is live and leaves them.
+   */
+  private async removeTwins() {
+    const myDevice = b64(this.chat.identity.publicKey);
+    const isAdmin = this.policy.admins.includes(this.chat.identity.fingerprint);
+    const heard = (leaf: number) => {
+      let best = -1n;
+      for (const k of Object.keys(this.meta.gens ?? {})) {
+        const [e, l] = k.split(':');
+        if (Number(l) === leaf && BigInt(e!) > best) best = BigInt(e!);
+      }
+      return best;
+    };
+    const doomed = () => {
+      const byDevice = new Map<string, MemberLeaf[]>();
+      for (const l of leaves(this.state)) byDevice.set(l.device, [...(byDevice.get(l.device) ?? []), l]);
+      const out: number[] = [];
+      for (const [device, ls] of byDevice) {
+        if (ls.length < 2) continue;
+        if (device === myDevice) {
+          out.push(...ls.filter((l) => l.leafIndex !== this.myLeaf).map((l) => l.leafIndex));
+          continue;
+        }
+        if (!isAdmin) continue;
+        const ranked = ls.map((l) => ({ l, at: heard(l.leafIndex) })).sort((a, b) => (a.at === b.at ? 0 : a.at > b.at ? -1 : 1));
+        if (ranked[0]!.at < 0n || ranked[0]!.at === ranked[1]!.at) continue; // can't tell which one is live
+        out.push(...ranked.slice(1).map((x) => x.l.leafIndex));
+      }
+      return out;
+    };
+    if (!doomed().length) return;
+    try {
+      await this.commit(() => doomed().map((i) => ({ proposalType: 'remove', remove: { removed: i } }) as mls.Proposal), () => doomed().length > 0);
+    } catch (err) {
+      if ((err as KeyholdError).code !== 'policy_rejected') throw err;
+    }
+  }
+
   private async removeUnjoined(gone?: (l: MemberLeaf) => boolean) {
     const now = this.chat.now();
     const since = (this.meta.unjoinedSince ??= {});
