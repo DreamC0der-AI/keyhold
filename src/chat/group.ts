@@ -157,6 +157,8 @@ interface GroupMeta {
   /** This device issued an address-only invite that expires at this time. */
   awaitingUpgradeUntil?: number;
   name?: string;
+  /** Group picture from the newest admin `meta` message ('' = removed). Opaque to keyhold. */
+  avatar?: string;
   removed?: boolean;
   /** The channel refuses us (for example the owner revoked access after removing us). */
   accessLost?: boolean;
@@ -210,6 +212,7 @@ interface Creating {
   groupId: string;
   kind: 'dm' | 'group';
   name?: string;
+  avatar?: string;
   /** The genesis log entry and the group state, base64. */
   entry: string;
   state: string;
@@ -556,14 +559,16 @@ export class Chat {
    * after that (the genesis entry not written, or its reply lost) can be finished later by
    * `finishCreates()` instead of leaving an empty space behind.
    */
-  async createGroup(kind: 'dm' | 'group' = 'group', name?: string): Promise<Group> {
+  /** `avatar`: an opaque picture string, sent with the name in the first `meta` message. */
+  async createGroup(kind: 'dm' | 'group' = 'group', name?: string, opts: { avatar?: string } = {}): Promise<Group> {
+    const avatar = opts.avatar || undefined;
     const cs = await ciphersuite();
     const kp = await this.keyPackage();
     const groupId = randomBytes(16);
     const policy = defaultPolicy(kind, this.identity.fingerprint);
     const state = await mls.createGroup(groupId, kp.publicPackage, kp.privatePackage, [encodePolicy(policy)], cs, this.clientConfig());
     const entry: LogEntry = { v: 1, i: 0, prev: '', kind: 'genesis', epoch: '0', gi: await groupInfoBytes(state, cs) };
-    const rec: Creating = { groupId: b64(groupId), kind, name, entry: b64(jsonBytes(entry)), state: b64(mls.encodeGroupState(state)), at: this.now() };
+    const rec: Creating = { groupId: b64(groupId), kind, name, avatar, entry: b64(jsonBytes(entry)), state: b64(mls.encodeGroupState(state)), at: this.now() };
     const eph = this.opts.device.ephemeral;
     this.creatingNow.add(rec.groupId);
     try {
@@ -572,7 +577,7 @@ export class Chat {
       await eph.put(CREATING + rec.groupId, jsonBytes(rec));
       const g = await this.finishCreate(rec, state);
       if (!g) throw new KeyholdError('conflict', 'new space already has a log');
-      if (name) await g.send({ t: 'meta', name });
+      if (name || avatar) await g.send({ t: 'meta', name, avatar });
       return g;
     } finally {
       this.creatingNow.delete(rec.groupId);
@@ -630,7 +635,7 @@ export class Chat {
         const g = await this.finishCreate(rec);
         if (!g) continue;
         out.push(g);
-        if (rec.name) await g.send({ t: 'meta', name: rec.name }).catch(() => undefined);
+        if (rec.name || rec.avatar) await g.send({ t: 'meta', name: rec.name, avatar: rec.avatar }).catch(() => undefined);
       } catch (e) {
         const code = (e as KeyholdError).code;
         if (code === 'forbidden' || code === 'not_found') await eph.delete(key); // the space is gone
@@ -1312,6 +1317,10 @@ export class Group {
   get name() {
     return this.meta.name;
   }
+  /** The group picture admins set (an opaque string; '' or undefined = none). */
+  get avatar() {
+    return this.meta.avatar;
+  }
   get active() {
     return !this.meta.removed && !this.meta.accessLost && this.state.groupActiveState.kind === 'active';
   }
@@ -1531,6 +1540,8 @@ export class Group {
     if (!this.meta.outbox.length) delete this.meta.outbox;
     this.meta.ownMail.push(...ids);
     const me = this.chat.identity;
+    // Our own name or picture change holds here too (others apply it when they receive it).
+    if (this.policy.admins.includes(me.fingerprint)) for (const i of items) if (i.message.t === 'meta') this.applyMeta(i.message);
     const from = { fingerprint: me.fingerprint, address: me.address, deviceId: me.deviceId };
     this.meta.undelivered = [...(this.meta.undelivered ?? []), ...items.map((i) => ({ message: i.message, from, epoch: i.epoch, own: true }))];
     // Saved before onMessage runs: if the tab closes now, the next sync hands them over.
@@ -2297,10 +2308,15 @@ export class Group {
     }
   }
 
+  private applyMeta(msg: AppMessage & { t: 'meta' }) {
+    if (typeof msg.name === 'string') this.meta.name = msg.name;
+    if (typeof msg.avatar === 'string') this.meta.avatar = msg.avatar;
+  }
+
   private async handleSystem(m: ReceivedMessage) {
     const msg = m.message;
     const isAdmin = this.policy.admins.includes(m.from.fingerprint);
-    if (msg.t === 'meta' && isAdmin && msg.name !== undefined) this.meta.name = msg.name;
+    if (msg.t === 'meta' && isAdmin) this.applyMeta(msg);
     if (msg.t === 'sys.grant' && isAdmin && msg.expiresAt > this.chat.now()) {
       if (await this.chat.provider.channel.canManage(this.meta.space)) await this.grantChannel(msg.address, msg.expiresAt);
     }
