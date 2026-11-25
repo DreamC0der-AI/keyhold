@@ -146,3 +146,45 @@ describe('a fast send that was late after all', () => {
     expect(texts(await gl.sync())).toEqual(['again please']);
   });
 });
+
+describe('a group made a moment ago', () => {
+  it('sends its name and its first invitations without reading the empty space first', async () => {
+    const clock = { t: 1_700_000_000_000 };
+    const now = () => clock.t;
+    const w = new MemoryWorld({ claimOnce: false, now });
+    const opts: TestUserOptions = { now, sendFreshMs: FRESH };
+    const bob = await makeUser(w.session('mem:bob'), 'mem:bob', opts);
+    const carol = await makeUser(w.session('mem:carol'), 'mem:carol', opts);
+    const dave = await makeUser(w.session('mem:dave'), 'mem:dave', opts);
+    const reads = () => (w.calls.get('log.read') ?? 0) + (w.calls.get('mailbox.list') ?? 0);
+
+    const before = reads();
+    const g = await bob.chat.createGroup('group', 'Hikers');
+    await g.invite(carol.address);
+    expect(reads()).toBe(before);
+    // Only the first: by the second invitation someone else may have written.
+    await g.invite(dave.address);
+    expect(reads()).toBeGreaterThan(before);
+
+    const [gc] = await carol.chat.acceptInvites();
+    const [gd] = await dave.chat.acceptInvites();
+    for (let r = 0; r < 3; r++) for (const x of [g, gc!, gd!]) await x.sync();
+    expect(g.members().filter((m) => !m.pending).map((m) => m.address).sort()).toEqual(['mem:bob', 'mem:carol', 'mem:dave']);
+    await g.send({ t: 'text', body: 'welcome' });
+    expect(texts(await gc!.sync())).toEqual(['welcome']);
+    expect(texts(await gd!.sync())).toEqual(['welcome']);
+  });
+
+  it('reads first when the group was made a while ago, or by an earlier session', async () => {
+    const clock = { t: 1_700_000_000_000 };
+    const now = () => clock.t;
+    const w = new MemoryWorld({ claimOnce: false, now });
+    const bob = await makeUser(w.session('mem:bob'), 'mem:bob', { now });
+    const carol = await makeUser(w.session('mem:carol'), 'mem:carol', { now });
+    const g = await bob.chat.createGroup();
+    clock.t += 31_000;
+    const before = w.calls.get('log.read') ?? 0;
+    await g.invite(carol.address);
+    expect(w.calls.get('log.read')).toBe(before + 1);
+  });
+});
