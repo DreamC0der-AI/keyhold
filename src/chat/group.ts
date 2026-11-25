@@ -1929,6 +1929,11 @@ export class Group {
     const p = this.chat.provider;
     const space = this.meta.space;
 
+    // The log is read while the mailbox is listed (they don't depend on each other: two round
+    // trips at once, not one after the other), but applied after it, as before.
+    const from = Math.max(0, this.meta.logNext - 1);
+    const logRead = p.orderedLog.read(space, from);
+    logRead.catch(() => undefined); // handled where it is awaited; not if the mailbox fails first
     // Mailbox first, bucketed by epoch, so each message is opened with the right epoch's keys.
     let mail: Awaited<ReturnType<typeof p.mailbox.list>>;
     try {
@@ -1973,8 +1978,7 @@ export class Group {
     this.meta.mailCursor = mail.cursor;
 
     // Log: verify that what we already processed is unchanged, then apply new entries.
-    const from = Math.max(0, this.meta.logNext - 1);
-    const raw = await p.orderedLog.read(space, from);
+    const raw = await logRead;
     if (this.meta.logNext > 0) {
       const first = raw[0];
       const known = this.meta.hashes[from] ?? (from === this.meta.logNext - 1 ? this.meta.lastHash : undefined);
