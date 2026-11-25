@@ -228,10 +228,12 @@ export function checkCommit(c: CommitCheck): Verdict {
       if (p.type === 'remove' && byLeaf.get(p.removed)?.root !== j.leaf.root) return deny('an external commit may only remove its own old leaves');
       if (p.type !== 'remove' && p.type !== 'external_init') return deny('external commits may only carry external init and own removes');
     }
-    const ownRootPresent = c.members.some((m) => m.root === j.leaf.root && !removedLeaves.has(m.leafIndex));
+    // A device of a member: another one, or this very device rejoining in place of its own leaf.
+    const own = (m: MemberLeaf) => m.root === j.leaf.root && (!removedLeaves.has(m.leafIndex) || m.device === j.leaf.device);
+    const ownRootPresent = c.members.some(own);
     if (ownRootPresent) {
       // Another device of a member: it must claim the same address as that member's other devices.
-      const same = c.members.find((m) => m.root === j.leaf.root && !removedLeaves.has(m.leafIndex))!;
+      const same = c.members.find(own)!;
       if (same.address !== j.leaf.address) return deny('a device must use the address of its owner');
     } else {
       // A new person: needs a valid, unused ticket from someone allowed to add them.

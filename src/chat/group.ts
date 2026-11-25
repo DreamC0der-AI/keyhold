@@ -164,6 +164,11 @@ interface GroupMeta {
   freshLeaf?: boolean;
   /** Epoch we joined at: older mail can't be ours to read, so it is skipped quietly. */
   joinedEpoch?: string;
+  /**
+   * The group went on in a way this device can't follow (a fork, or a commit we missed): rejoin
+   * from `gi`, the newest GroupInfo of the log, at the next automation step. `at` is its index.
+   */
+  rejoin?: { at: number; gi: string };
   /** When this device first saw each device leaf that was added but hasn't joined (admins clean up). */
   unjoinedSince?: Record<string, number>;
   /** Our messages, encrypted and saved, not yet known to be posted. A retry posts the same bytes. */
@@ -2139,6 +2144,17 @@ export class Group {
       out.events.push({ type: 'rejected', index: e.i, reason });
       if (e.kind === 'commit') this.meta.needsHeal = true;
     };
+    // A commit we can't even process (built on another epoch, or on another branch of this one):
+    // not a bad commit to answer with our own, which the others couldn't process either, so both
+    // sides would keep committing forever. If it is newer than our state, the group went on
+    // without us: rejoin from it. An older one (a lagging branch) is ignored.
+    const cannotFollow = (reason: string, builtOn: bigint) => {
+      out.events.push({ type: 'rejected', index: e.i, reason });
+      if (e.kind === 'commit' && e.gi && builtOn >= this.epoch) {
+        this.meta.rejoin = { at: e.i, gi: e.gi };
+        this.meta.needsHeal = false; // rejoining replaces it
+      }
+    };
     if (msg.wireformat !== 'mls_private_message' && msg.wireformat !== 'mls_public_message') return reject('not a handshake message');
     // Rule shared with joiners (scanLog): a ticket is burned the first time it appears in any
     // external commit in the log, whether or not that commit is accepted.
@@ -2148,7 +2164,7 @@ export class Group {
       if (t0 && !used.has(t0.nonce)) this.meta.usedNonces.push(t0.nonce);
     }
     const epoch = msg.wireformat === 'mls_private_message' ? msg.privateMessage.epoch : msg.publicMessage.content.epoch;
-    if (epoch !== this.epoch) return reject(`built on epoch ${epoch}, we are at ${this.epoch}`);
+    if (epoch !== this.epoch) return cannotFollow(`built on epoch ${epoch}, we are at ${this.epoch}`, epoch);
 
     const members = leaves(this.state);
     let joiner: { leaf: MemberLeaf; ticket?: VerifiedTicket } | undefined;
@@ -2196,7 +2212,8 @@ export class Group {
     try {
       result = await mls.processMessage(msg, this.state, mls.emptyPskIndex, callback, cs);
     } catch (err) {
-      return reject((err as Error).message);
+      // Policy and succession verdicts don't throw: this is a commit our keys can't open or check.
+      return cannotFollow((err as Error).message, epoch);
     }
     if (result.kind !== 'newState' || result.actionTaken === 'reject' || !verdict.ok) return reject(verdict.reason ?? 'rejected');
     // The committer's new path leaf (and any update) replaces a leaf in place: it must stay the
@@ -2205,7 +2222,10 @@ export class Group {
     if (swapped) return reject(swapped);
     this.state = result.newState;
     result.consumed.forEach(mls.zeroOutUint8Array);
-    if (e.kind === 'commit') this.meta.needsHeal = false;
+    if (e.kind === 'commit') {
+      this.meta.needsHeal = false;
+      this.meta.rejoin = undefined;
+    }
 
     if (this.state.groupActiveState.kind !== 'active') {
       out.events.push({ type: 'removed' });
@@ -2251,6 +2271,7 @@ export class Group {
     const me = this.chat.identity.fingerprint;
     const mayActOn = (l: MemberLeaf) => this.policy.admins.includes(me) || l.root === me;
     const revokedNow = () => leaves(this.state).filter((l) => l.leafIndex !== this.myLeaf && registry.isRevoked(l.device, l.address) && mayActOn(l));
+    if (this.meta.rejoin) await this.rejoinNow(out);
     const pendingProposals = Object.keys(this.state.unappliedProposals).length > 0;
     if (revokedNow().length || pendingProposals || this.meta.needsHeal || this.meta.freshLeaf) {
       try {
@@ -2288,6 +2309,84 @@ export class Group {
   }
 
   /**
+   * Rejoin the group from the newest GroupInfo with an external commit that replaces this device's
+   * own leaf (resync). For a device left on a branch the others don't follow: committing there
+   * would only grow the fork. Messages sent on the other branch before this are lost to it.
+   */
+  private async rejoinNow(out: SyncResult) {
+    const cs = await ciphersuite();
+    const p = this.chat.provider;
+    const giveUp = (reason: string) => {
+      out.events.push({ type: 'rejected', index: this.meta.rejoin?.at ?? this.meta.logNext, reason: `could not rejoin: ${reason}` });
+      this.meta.rejoin = undefined;
+    };
+    for (let attempt = 0; attempt < 4; attempt++) {
+      if (attempt > 0) await this.syncInner(false);
+      const want = this.meta.rejoin;
+      if (!want || !this.active) return;
+      let gi: mls.GroupInfo;
+      try {
+        const m = decodeMsg(unb64(want.gi));
+        if (m.wireformat !== 'mls_group_info') return giveUp('bad GroupInfo');
+        gi = m.groupInfo;
+      } catch {
+        return giveUp('bad GroupInfo');
+      }
+      if (b64(gi.groupContext.groupId) !== this.meta.groupId) return giveUp('GroupInfo of another group');
+      const tree = ratchetTreeOfGroupInfo(gi);
+      const untrusted = tree ? await this.chat.untrustedTree(tree, gi.signer) : 'no tree';
+      if (untrusted) return giveUp(untrusted);
+      const myDevice = b64(this.chat.identity.publicKey);
+      // Not in the group on that branch: nothing to rejoin (an invitation brings us back).
+      if (!leavesOfGroupInfo(gi).some((l) => l.device === myDevice)) return giveUp('this device is not in the group there');
+      const kp = await this.chat.keyPackage();
+      let made: Awaited<ReturnType<typeof mls.joinGroupExternal>>;
+      try {
+        made = await mls.joinGroupExternal(gi, kp.publicPackage, kp.privatePackage, true, cs, undefined, this.chat.clientConfig(), new Uint8Array());
+      } catch (err) {
+        return giveUp((err as Error).message);
+      }
+      const { publicMessage, newState } = made;
+      const entry: LogEntry = {
+        v: 1,
+        i: this.meta.logNext,
+        prev: this.meta.lastHash,
+        kind: 'commit',
+        epoch: String(newState.groupContext.epoch),
+        mls: b64(encodeMsg({ wireformat: 'mls_public_message', version: 'mls10', publicMessage })),
+        gi: await groupInfoBytes(newState, cs),
+      };
+      const bytes = jsonBytes(entry);
+      // As in commit: keep the would-be state until we know whether the append landed.
+      const pendingKey = `chat/pending/${this.meta.groupId}`;
+      const dev = this.chat.opts.device;
+      await dev.ephemeral.put(pendingKey, jsonBytes({ hash: await hashEntry(bytes), state: b64(mls.encodeGroupState(newState)) }));
+      const appended = await p.orderedLog.append(this.meta.space, entry.i, bytes);
+      if (appended !== 'ok') {
+        await dev.ephemeral.delete(pendingKey);
+        continue; // someone wrote first: read it, then try again on the newest state
+      }
+      const before = this.members();
+      this.state = newState;
+      await this.recordEntry(bytes, true);
+      this.diffMembers(before, out);
+      this.meta.rejoin = undefined;
+      this.meta.needsHeal = false;
+      this.meta.freshLeaf = undefined;
+      this.meta.sentSinceUpdate = 0;
+      this.meta.lastUpdateAt = this.chat.now();
+      // Like any joiner: what was written before this epoch can't be opened here.
+      this.meta.joinedEpoch = String(newState.groupContext.epoch);
+      this.meta.pending = this.meta.pending.filter((m) => BigInt(m.epoch) >= newState.groupContext.epoch);
+      await this.persist();
+      await dev.ephemeral.delete(pendingKey);
+      out.events.push({ type: 'rotated', epoch: this.epoch });
+      return;
+    }
+    giveUp('the group kept changing');
+  }
+
+  /**
    * Devices added with pre-keys that never joined: removed by an admin after the join deadline,
    * or earlier when `gone` says they no longer can (their channel invitation ended).
    */
@@ -2301,7 +2400,10 @@ export class Group {
     if (!this.policy.admins.includes(this.chat.identity.fingerprint)) return;
     const deadline = this.chat.opts.preKeys.joinDeadlineMs;
     // A grace period for the channel check: the invitation is made right after the add.
-    const due = () => unjoined().filter((l) => now - (since[l.device] ?? now) >= deadline || (gone?.(l) && now - (since[l.device] ?? now) >= 10 * 60_000));
+    // A pre-key leaf of a device that also joined with a leaf of its own is a leftover: two leaves
+    // with one signature key make the tree invalid for anyone joining, so it goes at once.
+    const joinedTwice = (l: MemberLeaf) => leaves(this.state).some((o) => o.leafIndex !== l.leafIndex && o.device === l.device && !unjoinedLeaf(this.state.ratchetTree[o.leafIndex * 2] as mls.NodeLeaf));
+    const due = () => unjoined().filter((l) => joinedTwice(l) || now - (since[l.device] ?? now) >= deadline || (gone?.(l) && now - (since[l.device] ?? now) >= 10 * 60_000));
     if (!due().length) return;
     try {
       await this.commit(() => due().map((l) => ({ proposalType: 'remove', remove: { removed: l.leafIndex } }) as mls.Proposal), () => due().length > 0);
