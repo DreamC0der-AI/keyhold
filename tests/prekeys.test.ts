@@ -192,7 +192,7 @@ describe('pre-keys (build option preKeys)', () => {
     expect(types((await g.sync()).events)).not.toContain('left');
     advance(DAY);
     const r = await g.sync();
-    expect(r.events).toContainEqual({ type: 'left', fingerprint: carol.identity.fingerprint, address: 'mem:carol', pending: true });
+    expect(r.events).toContainEqual({ type: 'left', fingerprint: carol.identity.fingerprint, address: 'mem:carol', pending: true, by: { fingerprint: bob.identity.fingerprint, address: 'mem:bob' } });
     expect(g.members()).toHaveLength(1);
   });
 

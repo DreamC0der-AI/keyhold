@@ -83,7 +83,10 @@ describe.each(worlds)('chat on %s', (_n, make) => {
     expect(gc!.active).toBe(false);
     await expect(gc!.send({ t: 'text', body: 'still here?' })).rejects.toMatchObject({ code: 'not_member' });
     await g.send({ t: 'text', body: 'carol is gone' });
-    expect(texts(await gd!.sync())).toEqual(['carol is gone']);
+    const rd = await gd!.sync();
+    expect(texts(rd)).toEqual(['carol is gone']);
+    // The others see who removed her, not a leave.
+    expect(rd.events.find((e) => e.type === 'left')).toMatchObject({ address: carol.address, by: { address: bob.address, fingerprint: bob.identity.fingerprint } });
     // channel access was taken away by the space owner
     expect((await bob.provider.channel.members(g.space)).active).not.toContain(carol.address);
     await expect(carol.provider.mailbox.list(g.space)).rejects.toBeTruthy();
@@ -99,9 +102,33 @@ describe.each(worlds)('chat on %s', (_n, make) => {
     await g.leave();
     expect(bob.chat.groups.size).toBe(0);
     const r = await gc!.sync();
-    expect(r.events.some((e) => e.type === 'left')).toBe(true);
+    const left = r.events.find((e) => e.type === 'left');
+    expect(left).toMatchObject({ address: bob.address });
+    expect(left).not.toHaveProperty('by');
     expect(gc!.members().map((m) => m.address)).toEqual([carol.address]);
     expect(gc!.policy.admins).toEqual([carol.identity.fingerprint]);
+  });
+
+  it('remove by an admin who is not the owner: everyone, the removed person too, learns who did it', async () => {
+    const w = make();
+    const [bob, carol, dave] = [await user(w, 'bob'), await user(w, 'carol'), await user(w, 'dave')];
+    const g = await bob.chat.createGroup();
+    await g.invite(carol.address);
+    await g.invite(dave.address);
+    const [gc] = await carol.chat.acceptInvites();
+    const [gd] = await dave.chat.acceptInvites();
+    await g.setPolicy({ ...g.policy, admins: [bob.identity.fingerprint, carol.identity.fingerprint] });
+    await gc!.sync();
+    await gd!.sync();
+    await gc!.remove(dave.identity.fingerprint);
+    // carol can't change channel access (bob owns the space), so dave still reads the commit.
+    const rd = await gd!.sync();
+    expect(rd.events.find((e) => e.type === 'removed')).toMatchObject({ by: { address: carol.address } });
+    const rb = await g.sync();
+    expect(rb.events.find((e) => e.type === 'left')).toMatchObject({ address: dave.address, by: { address: carol.address } });
+    // The remover's own app reports it the same way.
+    const rc = await gc!.sync();
+    expect(rc.events.find((e) => e.type === 'left')).toMatchObject({ address: dave.address, by: { address: carol.address } });
   });
 
   it('rotation: a new epoch every N messages and every T days', async () => {
