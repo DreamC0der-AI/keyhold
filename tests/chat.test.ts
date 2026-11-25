@@ -65,6 +65,28 @@ describe.each(worlds)('chat on %s', (_n, make) => {
     await gc!.send({ t: 'meta', name: 'hijacked' });
     await gd!.sync();
     expect(gd!.name).toBe('Hiking club 2026');
+    // the picture travels the same way, and a name-only meta keeps it
+    await g.send({ t: 'meta', avatar: 'pic-1' });
+    await gc!.send({ t: 'meta', avatar: 'hijacked' });
+    await g.send({ t: 'meta', name: 'Hikers' });
+    await gd!.sync();
+    expect([gd!.name, gd!.avatar]).toEqual(['Hikers', 'pic-1']);
+    await g.send({ t: 'meta', avatar: '' });
+    await gd!.sync();
+    expect(gd!.avatar).toBe('');
+  });
+
+  it('createGroup sends name and picture in one meta message', async () => {
+    const w = make();
+    const [bob, carol] = [await user(w, 'bob'), await user(w, 'carol')];
+    const g = await bob.chat.createGroup('group', 'Club', { avatar: 'pic' });
+    expect([g.name, g.avatar]).toEqual(['Club', 'pic']);
+    await g.invite(carol.address);
+    const [gc] = await carol.chat.acceptInvites();
+    // carol joined after the first meta: she learns it when an admin repeats it
+    await g.send({ t: 'meta', name: g.name, avatar: g.avatar });
+    await gc!.sync();
+    expect([gc!.name, gc!.avatar]).toEqual(['Club', 'pic']);
   });
 
   it('remove: MLS first, then channel access; the removed member reads nothing new', async () => {
