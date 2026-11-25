@@ -98,7 +98,9 @@ describe('a fast send that was late after all', () => {
     await gc.sync();
     const sent = await g.send({ t: 'text', body: 'did the laptop get this?' }); // encrypted in the old epoch
     // The laptop can't read the old epoch; carol's first device still can.
-    expect(texts(await gl.sync())).toEqual([]);
+    const early = await gl.sync();
+    expect(texts(early)).toEqual([]);
+    expect(early.events).toEqual([]); // from before it joined, as far as its keys go: not an error
     expect(ids(await gc.sync())).toEqual([sent.id]);
 
     // bob's next sync sees the join and sends it again in the new epoch.

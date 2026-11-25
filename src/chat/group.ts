@@ -775,6 +775,8 @@ export class Chat {
       if (t) meta.usedNonces.push(t.nonce);
       // Messages from before we joined can't be read (MLS has no pre-join history); skip them.
       meta.mailCursor = (await p.mailbox.list(space)).cursor;
+      // Also one posted after this, by someone who had not seen us join yet: not an error.
+      meta.joinedEpoch = String(newState.groupContext.epoch);
       const g = new Group(this, meta, newState);
       await g.persist();
       this.groups.set(meta.groupId, g);
