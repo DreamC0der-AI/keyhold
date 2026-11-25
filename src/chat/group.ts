@@ -275,6 +275,8 @@ export const DEFAULT_PREKEYS: PreKeyPolicy = { rotateMs: 7 * DAY, keepMs: 7 * DA
 export const PREKEY_EXTENSION = 0xf0a2;
 /** A send skips its sync only if the epoch has been the same for this many `sendFreshMs`. */
 const EPOCH_SETTLE = 4;
+/** How long a group this device created counts as holding nothing but what this device wrote. */
+const JUST_CREATED_MS = 30_000;
 const MAX_FAST_SENT = 50;
 
 interface PreKeyInfo {
@@ -558,7 +560,8 @@ export class Chat {
     const bytes = unb64(rec.entry);
     const hash = await hashEntry(bytes);
     const log = this.provider.orderedLog;
-    if ((await log.append(rec.space!, 0, bytes)) !== 'ok') {
+    const wrote = (await log.append(rec.space!, 0, bytes)) === 'ok';
+    if (!wrote) {
       // Maybe ours, from a try whose reply was lost.
       const [first] = await log.read(rec.space!, 0);
       if (!first || (await hashEntry(first)) !== hash) {
@@ -569,6 +572,8 @@ export class Chat {
     const meta = this.newMeta(rec.groupId, rec.space!, 1, hash, rec.name);
     meta.ownEntries.push(0);
     const g = new Group(this, meta, state ?? this.decodeState(unb64(rec.state)));
+    // Our first entry went into an empty log just now: the space holds nothing we don't know.
+    if (wrote) g.justCreated();
     await g.persist();
     this.groups.set(meta.groupId, g);
     await this.opts.device.ephemeral.delete(key);
@@ -1243,6 +1248,16 @@ export class Group {
   private buffered: SyncResult = { messages: [], events: [] };
   /** When the last complete sync of this group started (this session only). */
   private pulledAt = -Infinity;
+  /** When this device made the group, while that still counts as "just now" (see justCreated). */
+  private createdAt = -Infinity;
+  /**
+   * This device created the group and wrote its first log entry a moment ago. Until someone is
+   * invited nobody else can reach the space, so it counts as synced: a first message (the
+   * group's name) and the first invitations go out without reading the empty space first.
+   */
+  justCreated() {
+    this.createdAt = this.pulledAt = this.chat.now();
+  }
   /** When this device last saw the group change epoch (this session only), and that epoch. */
   private epochChangedAt = -Infinity;
   private epochSeen?: bigint;
@@ -1616,7 +1631,12 @@ export class Group {
 
   private async inviteManyNow(people: PreparedInvite[], options: InviteOptions): Promise<InviteResult[]> {
     this.requireActive();
-    await this.pull();
+    // The first invitation into a group made a moment ago: nobody else can have written to its
+    // space yet, so there is nothing to read first. (Were that ever wrong, the commit below
+    // would not land: log entries are create-only.)
+    const fresh = this.chat.now() - this.createdAt < JUST_CREATED_MS;
+    this.createdAt = -Infinity;
+    if (!fresh) await this.pull();
     const me = this.chat.identity;
     const policy = this.policy;
     if (policy.adds === 'none' || (policy.adds === 'admins' && !policy.admins.includes(me.fingerprint))) {
