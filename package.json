@@ -56,7 +56,7 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "prepare": "npm run build",
+    "prepare": "node scripts/patch-ts-mls.mjs && npm run build",
     "test:browser": "node tests/browser/run.mjs"
   },
   "dependencies": {
