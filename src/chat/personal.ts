@@ -170,7 +170,9 @@ export class PersonalData {
       this.repairs++;
       this.queue.set(id, merge(kept, this.queue.get(id))!);
     }
-    if (remote && canonicalJson(merge(remote, undefined)) !== canonicalJson(kept ?? null)) await this.writeLocal(id, item);
+    // Not awaited: reads stay as fast as without a device copy. A copy that doesn't get written
+    // now is written at the next read of this record or flush.
+    if (remote && canonicalJson(merge(remote, undefined)) !== canonicalJson(kept ?? null)) void this.writeLocal(id, item).catch(() => undefined);
     const entry = { item, version: v?.version ?? '' };
     this.cache.set(id, entry);
     return entry;
