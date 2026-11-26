@@ -2347,6 +2347,9 @@ export class Group {
     if (this.meta.removed || this.meta.adminsReset) return out;
     const p = this.chat.provider;
     const space = this.meta.space;
+    // Members' directories that are due a re-read (automate needs them fresh): asked for now, so
+    // they come in while the mailbox and the log are read instead of one after the other afterwards.
+    const dirs = withAutomation ? this.refreshDirectories() : undefined;
 
     // The log is read while the mailbox is listed (they don't depend on each other: two round
     // trips at once, not one after the other), but applied after it, as before.
@@ -2447,6 +2450,7 @@ export class Group {
     if (withAutomation && this.active) {
       // Before our own housekeeping commits: only what others did makes a fast send stale.
       await this.repostStale();
+      await dirs;
       if (this.active) await this.automate(out);
     }
     if (this.active) {
@@ -2739,17 +2743,9 @@ export class Group {
   /** Housekeeping after a sync: heal forks, commit pending removes, drop revoked devices, rotate, fix channel access. */
   private async automate(out: SyncResult) {
     const registry = this.chat.opts.registry;
-    // Re-read members' directories now and then, so revoked devices get removed.
-    for (const m of this.members()) {
-      const at = registry.lookedAt(m.address);
-      if (at === undefined || this.chat.now() - at > this.chat.opts.directoryMaxAgeMs) {
-        try {
-          await registry.lookup(m.address);
-        } catch {
-          /* a broken directory is reported by the app; it never blocks the chat */
-        }
-      }
-    }
+    // Re-read members' directories now and then, so revoked devices get removed. (The sync asked
+    // for the due ones at its start; this covers members the log just added.)
+    await this.refreshDirectories();
     // Our own key was reset on another device: this device must not change the group any more.
     if (this.selfReset()) return;
     if (await this.handleResets(out)) return;
@@ -2779,11 +2775,26 @@ export class Group {
     // device has an address-only invite out, else every 10 minutes (for invites from my other devices).
     const now = this.chat.now();
     const waiting = (this.meta.awaitingUpgradeUntil ?? 0) > now;
-    if (this.policy.admins.includes(this.chat.identity.fingerprint) && (waiting || now - this.lastRequests > 10 * 60_000)) {
+    const answer = this.policy.admins.includes(this.chat.identity.fingerprint) && (waiting || now - this.lastRequests > 10 * 60_000);
+    // Who has access is only read here, so it is asked for while the join requests are: one
+    // round trip for both. reconcileNow decides by itself whether it uses the answer.
+    const access = answer && (await this.reconcileDue()) ? this.chat.provider.channel.members(this.meta.space) : undefined;
+    access?.catch(() => undefined); // handled where it is awaited
+    if (answer) {
       this.lastRequests = now;
       await this.answerJoinRequests();
     }
-    await this.reconcileNow();
+    await this.reconcileNow(false, access);
+  }
+
+  /** Members whose directory is due a re-read, all read at once. A broken directory is reported by the app; it never blocks the chat. */
+  private async refreshDirectories(): Promise<void> {
+    const registry = this.chat.opts.registry;
+    const due = this.members().filter((m) => {
+      const at = registry.lookedAt(m.address);
+      return at === undefined || this.chat.now() - at > this.chat.opts.directoryMaxAgeMs;
+    });
+    await Promise.all(due.map((m) => registry.lookup(m.address).catch(() => undefined)));
   }
 
   /**
@@ -3064,20 +3075,28 @@ export class Group {
     if (ended.size) await this.removeUnjoined((l) => ended.has(l.address));
   }
 
-  private async reconcileNow(force = false): Promise<{ revoked: Address[] }> {
-    const ch = this.chat.provider.channel;
-    if (!this.active || !(await ch.canManage(this.meta.space))) return { revoked: [] };
-    const now = this.chat.now();
+  /** Would reconcileNow read who has access now? */
+  private async reconcileDue(): Promise<boolean> {
+    if (!this.active || !(await this.chat.provider.channel.canManage(this.meta.space))) return false;
     const sig = leaves(this.state).map((l) => l.leafIndex + l.root).join();
     // While someone this device invited hasn't joined, look every 2 minutes: a decline should take
     // them out of the encryption soon. Otherwise every 10 minutes.
     const granted = this.meta.grantedAt ?? {};
     const waiting = leaves(this.state).some((l) => granted[l.address] !== undefined && unjoinedLeaf(this.state.ratchetTree[l.leafIndex * 2] as mls.NodeLeaf));
     const every = waiting ? 2 * 60_000 : 10 * 60_000;
-    if (!force && this.lastMembership === sig && now - (this.meta.lastReconcile ?? 0) < every) return { revoked: [] };
-    this.lastMembership = sig;
+    return this.lastMembership !== sig || this.chat.now() - (this.meta.lastReconcile ?? 0) >= every;
+  }
+
+  /** `access`: who has access, if the caller already asked for it (a moment ago). */
+  private async reconcileNow(force = false, access?: Promise<{ active: Address[]; pending: Address[] }>): Promise<{ revoked: Address[] }> {
+    const ch = this.chat.provider.channel;
+    if (!this.active || !(await ch.canManage(this.meta.space))) return { revoked: [] };
+    const now = this.chat.now();
+    const granted = this.meta.grantedAt ?? {};
+    if (!force && !(await this.reconcileDue())) return { revoked: [] };
+    this.lastMembership = leaves(this.state).map((l) => l.leafIndex + l.root).join();
     this.meta.lastReconcile = now;
-    const { active, pending } = await ch.members(this.meta.space);
+    const { active, pending } = await (access ?? ch.members(this.meta.space));
     // Added with pre-keys, but their channel invitation is gone (declined or expired): they can
     // never join, so take them out of the group too.
     const invited = new Set<Address>([...active, ...pending]);
