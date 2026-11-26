@@ -104,7 +104,7 @@ Commits that break a rule are rejected by every honest member, and the first mem
 
 ## 5. Personal data
 
-`PersonalData` (box 12) seals every item with K, under an opaque id (an HMAC of the logical key), and merges concurrent edits per field, last writer wins. Writes are queued and flushed. `historyRecorder` wires the message history backup to a chat client. `backupRootKey` / `restoreRootKey` keep the root key in the vault (box 9).
+`PersonalData` (box 12) seals every item with K, under an opaque id (an HMAC of the logical key), and merges concurrent edits per field, last writer wins. Writes are queued and flushed. Open it with `{ local: device.keystore }`: each record (except the history backup) is then also kept on the device and merged with what the store returns, so the storage can't roll a record back or delete it unnoticed. That includes the TOFU pins (`pinStore()`): without the device copy, a deleted contact record resets trust in that person's key. `historyRecorder` wires the message history backup to a chat client. `backupRootKey` / `restoreRootKey` keep the root key in the vault (box 9).
 
 ## 6. Using it
 
@@ -131,5 +131,31 @@ await chat.acceptInvites();                        // also on a timer
 ```
 
 `device` is a `DeviceStorage`. Tests use `memoryDevice()`. A browser app needs an IndexedDB version (not included yet).
+
+## 7. What an app must do
+
+These are part of the API contract, not suggestions.
+
+**One `Chat` per device.** A device is one `DeviceStorage` (boxes 1 and 2). Run at most one `Chat` on it at a time: two would encrypt from the same ratchet state (nonce reuse) and fork the device off its groups. Keyhold doesn't lock; the app must (for example one active tab, with a takeover that stops the old one first).
+
+**Dedupe messages by sender and id.** Delivery is at least once. The same message can arrive twice with the same `id`: a send retried after a lost reply, or a fast send posted again in a newer epoch (see below). Keep the first copy of each `(from.fingerprint, message.id)`. Don't dedupe by `id` alone: ids are chosen by senders, so another member could reuse one.
+
+**Fast sends (`sendFreshMs`) and removals.** With `sendFreshMs > 0`, a send right after a sync skips its own sync. If someone was removed after that sync, the message is encrypted in the epoch the removal ended, and the removed device still has those keys. So, for at most about `sendFreshMs` after a removal:
+
+- The removed device can receive that message. Keyhold marks such messages `fast`. When a device processes its own removal, it emits `{ type: 'retracted', ids }` (before `removed`) with the fast messages it got in that last epoch, and drops any not yet delivered. An honest app deletes them from the device, from its history backup and from any notification.
+- A modified app can ignore `retracted` and keep them. That is the price of the option. Leave `sendFreshMs` at 0 where it is not acceptable (for example groups where removals are for safety).
+- The sender's next sync notices the newer epoch and posts the message again for the current members (same `id`, without `fast`). Members who joined in between get it too.
+- `retracted` can also name fast messages that were sent before the removal in that epoch. Losing them on the removed device is harmless: that device is leaving the chat anyway.
+
+**Provider errors.** Providers throw `KeyholdError` with these codes, and keyhold relies on them:
+
+| Code | When | What keyhold does |
+| --- | --- | --- |
+| `forbidden` | the channel no longer lets this account in (mailbox list) | group marked `accessLost`, event `access-lost`, no further syncs until access returns |
+| `forbidden` or `not_found` | the space of an unfinished creation is gone | the creation is forgotten |
+| `conflict` | a write lost a race the caller can't retry (mailbox post with a used id and other bytes) | thrown to the app |
+| anything else | network, rate limits, bugs | thrown to the app; the next call retries. Never map a transient failure to `forbidden`. |
+
+**Forks.** A device that can't follow the log rejoins from the newest GroupInfo only when that GroupInfo could have come from its group: newer than its state, signed by a current member, the same rules (or a change the signer may make), the same people (or changes the signer may make), no banned device. Otherwise it stays where it is and reports `{ type: 'rejected', reason: 'could not rejoin: ...' }`. Show it as a sync problem; the next honest commit usually settles it.
 
 See `docs/chat-audit.md` for the audit, known limits and what was not tested against real GitHub.

@@ -47,9 +47,27 @@ All with tests in `tests/attacks.test.ts` and `tests/chat.test.ts`:
 - Personal-store ids and contents are opaque. A different K can't open them.
 - The full DM flow works in real Chromium (`npm run test:browser`).
 
+## Second audit, library view (2026-11-25)
+
+Keyhold on its own terms, as a library other apps could use, covering PRs #12 to #18. Each fix has a test (file in brackets).
+
+| # | Severity | Finding | Fix |
+| --- | --- | --- | --- |
+| K1 | Critical | Rejoining after a fork took the GroupInfo of any unprocessable commit entry. Anyone who can write the log (the storage operator, a removed member whose channel access lags) could write an old GroupInfo again: members rejoined an old epoch that still had removed members, who could read them. | A rejoin GroupInfo must be newer than our state, signed by a current member, keep our rules and people (or make only changes the signer may make), and have no banned device. A refused rejoin keeps a pending heal. [rejoin-guard] |
+| K2 | Critical | The same path let any member post a GroupInfo with its own rules (itself as sole admin) or without other people; every member, admins included, followed it. | Same checks. [rejoin-guard] |
+| K3 | High | Joiners took the GroupInfo of any well-formed entry, including ones members ignore. | Only genesis and commit entries count, and the highest epoch wins. [adversary: look-alike GroupInfo] |
+| H1 | High | TOFU pins lived only in the personal store: the operator could delete a contact record (or the index) and swap the directory, and the new key was accepted as first seen. | `PersonalData.open(..., { local })` keeps a device copy of every record and of the index key. [personal-local] |
+| M1 | Medium | Personal records could be rolled back or deleted unnoticed (blocks, chat-ended tombstones). | The device copy is merged in and written back (`repairs`). [personal-local] |
+| M2 | Medium | `sendFreshMs` can deliver a message to a device removed since the sender's last sync. | Documented trade-off; fast messages are marked and a removed device emits `retracted`. [fast-send] |
+| M3 | Medium | Duplicate deliveries (same id) were not part of the documented contract. | Section 7 of chat-storage.md: dedupe by sender and id. |
+| L1 | Low | Provider error codes keyhold relies on were undocumented. | Section 7 of chat-storage.md. |
+| L2 | Low | One `Chat` per device was assumed, not documented. | Section 7 of chat-storage.md. |
+| L3 | Low | Twin cleanup matched sends by leaf index across epochs, though indexes are reused. | Only sends from the same device count. |
+| L4 | Low | Over 50 fast sends without a sync lost repost tracking for the oldest. | A send syncs first once 50 are waiting. |
+
 ## Known limits (not fixed)
 
-1. **Joining a fork.** A joiner takes the newest GroupInfo in the log. If the newest entry is a commit that members rejected, and no honest member has synced since to post a healing commit, the joiner ends up in a fork with only the malicious member. It notices when the next honest commit fails to apply, but recovery (rejoin) is manual. A fix is to have joiners wait for a later honest commit, or have members sign the "current head".
+1. **Joining a fork.** A joiner takes the GroupInfo with the highest epoch from the genesis entry and commit entries (not from entries members ignore, so an old GroupInfo written again never wins). If that commit is one members rejected (a malicious member's), and no honest member has synced since to post a healing commit, the joiner ends up in a fork with only that member. It notices when the next honest commit fails to apply; existing members, by contrast, only rejoin from a GroupInfo that passes the checks in section 7 of chat-storage.md. A full fix is to have members sign the "current head".
 2. **Revoked device window.** A stolen device with a working GitHub session can rejoin until an admin's or its owner's app notices the revocation (directories are re-read every hour by default). Revoking the GitHub session is still the user's job.
 3. **Space owner leaves.** On GitHub only the repo owner can change access. If the owner leaves or deletes their account, the group keeps working cryptographically, but nobody can let people in or out at the channel level. Organisation-owned repos would fix this.
 4. **Address claims of added members.** In an offline add (box 4), the adder checks the KeyPackage against the invitee's directory; other members trust the adder (an admin) on that.

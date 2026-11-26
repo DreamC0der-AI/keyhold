@@ -35,7 +35,11 @@ export type AppContent =
    */
   | { t: 'sys.close'; reason?: 'closed' | 'moved' };
 
-export type AppMessage = AppContent & { v: 1; id: string; ts: number };
+/**
+ * `fast`: sent without a sync first (`ChatOptions.sendFreshMs`). A device that turns out to have
+ * been removed in that epoch is told to take such messages back (`retracted` event).
+ */
+export type AppMessage = AppContent & { v: 1; id: string; ts: number; fast?: true };
 
 const TYPES = new Set(['text', 'edit', 'delete', 'react', 'receipt', 'attachment', 'meta', 'sys.grant', 'sys.close']);
 

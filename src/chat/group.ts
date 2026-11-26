@@ -21,7 +21,7 @@ import { decryptSenderData } from 'ts-mls/privateMessage.js';
 import { decryptGroupInfo, decryptGroupSecrets } from 'ts-mls/welcome.js';
 import { accumulatePskSecret } from 'ts-mls/pskIndex.js';
 import { randomBytes, sha256, toHex, utf8 } from '../util/bytes.js';
-import { b64, jsonBytes, parseJsonBytes, unb64 } from '../util/codec.js';
+import { b64, canonicalJson, jsonBytes, parseJsonBytes, unb64 } from '../util/codec.js';
 import { KeyholdError } from '../util/errors.js';
 import { open as openSealed, seal } from '../crypto/index.js';
 import type { Address, Bytes, DeviceStorage, SpaceRef, StorageProvider } from '../storage/interfaces.js';
@@ -118,6 +118,7 @@ interface LogEntry {
 }
 
 const hashEntry = async (b: Bytes) => b64(await sha256(b));
+const canonical = (v: unknown) => canonicalJson(v);
 
 function encodeMsg(m: mls.MLSMessage): Uint8Array {
   return mls.encodeMlsMessage(m);
@@ -180,6 +181,8 @@ interface GroupMeta {
    * If a later sync finds the group had already moved on, they are sent again in the new epoch.
    */
   fastSent?: { message: AppMessage; epoch: string; at: number; tries?: number }[];
+  /** Recent messages from others marked `fast`, by epoch: retracted if we turn out to be removed. */
+  fastSeen?: { id: string; epoch: string }[];
   /** Hashes of our recent ciphertexts: our own mail even when we never learnt its id. */
   ownHashes?: string[];
   /** Hashes of recent mail from others: a copy posted twice is opened once. */
@@ -376,6 +379,12 @@ export type GroupEvent =
    * A dropped LAST message of an epoch can't be noticed this way.
    */
   | { type: 'gap'; from: ReceivedMessage['from']; epoch: bigint; missing: number }
+  /**
+   * Comes with `removed`: messages that reached this device although it was already removed
+   * (sent with `sendFreshMs` by someone who hadn't synced the removal yet). An honest app
+   * deletes them from this device, and from any history backup. See `ChatOptions.sendFreshMs`.
+   */
+  | { type: 'retracted'; ids: string[] }
   /** We are out of the group. `by`: who removed us, when we can tell (absent when we left). */
   | { type: 'removed'; by?: Remover }
   | { type: 'rotated'; epoch: bigint }
@@ -1157,6 +1166,15 @@ interface LogScan {
   epochIndex: Map<string, number>;
 }
 
+function giEpoch(gi: string): bigint | undefined {
+  try {
+    const m = decodeMsg(unb64(gi));
+    return m.wireformat === 'mls_group_info' ? m.groupInfo.groupContext.epoch : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Check the hash chain of a whole log and collect what a joiner needs. */
 async function scanLog(raw: Bytes[]): Promise<LogScan> {
   const hashes: string[] = [];
@@ -1164,6 +1182,7 @@ async function scanLog(raw: Bytes[]): Promise<LogScan> {
   const epochIndex = new Map<string, number>();
   let prev = '';
   let lastGi = '';
+  let lastGiEpoch: bigint | undefined;
   for (let i = 0; i < raw.length; i++) {
     let e: LogEntry | undefined;
     try {
@@ -1177,7 +1196,17 @@ async function scanLog(raw: Bytes[]): Promise<LogScan> {
     // A malformed entry (garbage from a member, or a broken chain) is skipped, never fatal:
     // otherwise any member could block the group by writing junk.
     if (!wellFormed || !e) continue;
-    if (e.gi) lastGi = e.gi;
+    // The GroupInfo to join from: only the genesis entry's and those of commits (an entry with a
+    // GroupInfo but nothing members apply is ignored by members, so it must not steer joiners),
+    // and of those the one with the highest epoch, so an old GroupInfo written again later (which
+    // would put a joiner into an old epoch with people removed since) never wins.
+    if (e.gi && ((i === 0 && e.kind === 'genesis') || (e.kind === 'commit' && e.mls))) {
+      const ep = giEpoch(e.gi);
+      if (ep !== undefined && (lastGiEpoch === undefined || ep >= lastGiEpoch)) {
+        lastGi = e.gi;
+        lastGiEpoch = ep;
+      }
+    }
     if (!epochIndex.has(e.epoch)) epochIndex.set(e.epoch, i);
     if (e.kind === 'commit' && e.mls) {
       try {
@@ -1420,7 +1449,7 @@ export class Group {
       // Strictly increasing times, so a burst keeps its order wherever it is sorted by time.
       const ts = Math.max(this.chat.now(), this.lastSentTs + 1);
       this.lastSentTs = ts;
-      return { v: 1, id: newMessageId(), ts, ...content } as AppMessage;
+      return { v: 1, id: newMessageId(), ts, ...content, ...(fast ? { fast: true } : {}) } as AppMessage;
     });
     return this.encryptAndPost(messages, fast);
   }
@@ -1445,6 +1474,7 @@ export class Group {
     if (this.meta.outbox?.length) return false; // an earlier send is unsettled: a sync sorts it out
     if (this.meta.pending.some((m) => BigInt(m.epoch) > this.epoch)) return false; // mail from an epoch we haven't reached
     if (this.meta.fastSent?.some((f) => BigInt(f.epoch) < this.epoch)) return false; // a repost is due
+    if ((this.meta.fastSent?.length ?? 0) >= MAX_FAST_SENT) return false; // tracking is full: sync, which settles it
     return true;
   }
 
@@ -1495,7 +1525,11 @@ export class Group {
     set(watch);
     if (!stale.length) return;
     try {
-      await this.encryptAndPost(stale.map((f) => f.message), false);
+      // The copy went out after a sync: not `fast` (it is the one a removed device never gets).
+      await this.encryptAndPost(
+        stale.map(({ message: { fast: _f, ...m } }) => m as AppMessage),
+        false,
+      );
     } catch {
       // The originals are sent; a copy that did not go out is not an unsent message. Try again
       // at the next sync, a few times.
@@ -2217,6 +2251,7 @@ export class Group {
       try {
         const m = await this.openApplication(unb64(item.data));
         if (m) {
+          if (m.message.fast) this.meta.fastSeen = [...(this.meta.fastSeen ?? []), { id: m.message.id, epoch: String(m.epoch) }].slice(-200);
           await this.handleSystem(m);
           // Kept with the state that spent its key, so an app error can't lose it (see redeliver).
           (this.meta.undelivered ??= []).push({ message: m.message, from: m.from, epoch: String(m.epoch) });
@@ -2338,8 +2373,9 @@ export class Group {
     const cannotFollow = (reason: string, builtOn: bigint) => {
       out.events.push({ type: 'rejected', index: e.i, reason });
       if (e.kind === 'commit' && e.gi && builtOn >= this.epoch) {
+        // Kept until the rejoin happens: if the GroupInfo turns out not to be a safe place to
+        // rejoin (see rejoinProblem), a pending heal must still go out.
         this.meta.rejoin = { at: e.i, gi: e.gi };
-        this.meta.needsHeal = false; // rejoining replaces it
       }
     };
     if (msg.wireformat !== 'mls_private_message' && msg.wireformat !== 'mls_public_message') return reject('not a handshake message');
@@ -2418,6 +2454,15 @@ export class Group {
 
     const removers = removersOf(members, removes);
     if (this.state.groupActiveState.kind !== 'active') {
+      // Sent fast in the epoch that removed us: the sender hadn't seen the removal yet.
+      const late = (this.meta.fastSeen ?? []).filter((f) => f.epoch === String(epoch)).map((f) => f.id);
+      if (late.length) {
+        const gone = new Set(late);
+        out.messages = out.messages.filter((m) => !gone.has(m.message.id));
+        if (this.meta.undelivered) this.meta.undelivered = this.meta.undelivered.filter((u) => !gone.has(u.message.id));
+        out.events.push({ type: 'retracted', ids: late });
+      }
+      delete this.meta.fastSeen;
       const by = removers.get(this.chat.identity.fingerprint);
       out.events.push(by ? { type: 'removed', by } : { type: 'removed' });
       await this.forget();
@@ -2530,6 +2575,8 @@ export class Group {
       const tree = ratchetTreeOfGroupInfo(gi);
       const untrusted = tree ? await this.chat.untrustedTree(tree, gi.signer) : 'no tree';
       if (untrusted) return giveUp(untrusted);
+      const problem = this.rejoinProblem(gi);
+      if (problem) return giveUp(problem);
       const myDevice = b64(this.chat.identity.publicKey);
       // Not in the group on that branch: nothing to rejoin (an invitation brings us back).
       if (!leavesOfGroupInfo(gi).some((l) => l.device === myDevice)) return giveUp('this device is not in the group there');
@@ -2581,6 +2628,51 @@ export class Group {
   }
 
   /**
+   * Why we must not rejoin from this GroupInfo; undefined when we may. Anyone who can write the
+   * log can put a GroupInfo there, so it only counts as "the group went on without us" when it
+   * could have come from the group we know:
+   * - it is newer than our state (an old one, replayed, would bring back removed people);
+   * - it is signed by a device that is a member in our state (not a removed one);
+   * - its rules are ours, or a change the signer may make under our rules (admins only);
+   * - the people in it are ours, or the signer may add and remove under our rules;
+   * - no device in it is banned.
+   * Otherwise this device stays where it is and reports it (a `rejected` event): a fork it
+   * can't safely leave is better than a group someone else wrote.
+   */
+  private rejoinProblem(gi: mls.GroupInfo): string | undefined {
+    if (gi.groupContext.epoch <= this.epoch) return 'the GroupInfo is not newer than our state';
+    let theirs: GroupPolicy;
+    try {
+      theirs = decodePolicy(gi.groupContext.extensions as never);
+    } catch {
+      return 'the GroupInfo has no valid policy';
+    }
+    const ours = this.policy;
+    const mine = leaves(this.state);
+    const tree = leavesOfGroupInfo(gi);
+    const signer = tree.find((l) => l.leafIndex === gi.signer);
+    const signerHere = signer && mine.find((l) => l.device === signer.device && l.root === signer.root);
+    if (!signerHere) return 'the GroupInfo is signed by a device that is not a member here';
+    const admin = ours.admins.includes(signerHere.root);
+    if (canonical(theirs) !== canonical(ours)) {
+      if (!admin) return 'the GroupInfo changes the group rules';
+      if (theirs.kind !== ours.kind) return 'the GroupInfo changes the kind of chat';
+    }
+    const rootsHere = new Set(mine.map((l) => l.root));
+    const rootsThere = new Set(tree.map((l) => l.root));
+    for (const r of rootsThere) {
+      if (rootsHere.has(r)) continue;
+      const mayAdd = ours.adds === 'members' || (ours.adds === 'admins' && admin);
+      if (!mayAdd) return 'the GroupInfo has people the signer may not add';
+    }
+    for (const r of rootsHere) if (!rootsThere.has(r) && !admin && r !== signerHere.root && r !== this.chat.identity.fingerprint) return 'the GroupInfo leaves out people the signer may not remove';
+    const banned = new Set([...ours.banned, ...theirs.banned].map((b) => b.device));
+    if (tree.some((l) => banned.has(l.device))) return 'the GroupInfo has a banned device';
+    if (ours.maxPeople > 0 && rootsThere.size > ours.maxPeople) return `the GroupInfo has more than ${ours.maxPeople} people`;
+    return undefined;
+  }
+
+  /**
    * Devices added with pre-keys that never joined: removed by an admin after the join deadline,
    * or earlier when `gone` says they no longer can (their channel invitation ended).
    */
@@ -2593,11 +2685,15 @@ export class Group {
   private async removeTwins() {
     const myDevice = b64(this.chat.identity.publicKey);
     const isAdmin = this.policy.admins.includes(this.chat.identity.fingerprint);
+    // Newest epoch this leaf sent in. Leaf indexes are reused after removals, so only entries
+    // from this very device count.
     const heard = (leaf: number) => {
+      const node = this.state.ratchetTree[leaf * 2] as mls.NodeLeaf | undefined;
+      const deviceId = node ? certificateFromCredential(node.leaf.credential as never)?.deviceId : undefined;
       let best = -1n;
-      for (const k of Object.keys(this.meta.gens ?? {})) {
+      for (const [k, t] of Object.entries(this.meta.gens ?? {})) {
         const [e, l] = k.split(':');
-        if (Number(l) === leaf && BigInt(e!) > best) best = BigInt(e!);
+        if (Number(l) === leaf && t.from.deviceId === deviceId && BigInt(e!) > best) best = BigInt(e!);
       }
       return best;
     };
