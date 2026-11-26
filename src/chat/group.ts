@@ -784,6 +784,11 @@ export class Chat {
       }
       if (msg.wireformat !== 'mls_welcome') continue;
       const g = await this.joinWithWelcome(space, msg.welcome);
+      if (g === 'stale') {
+        // From an earlier time in this group (we left or were removed since): never join with it.
+        if (msg.welcome.secrets.length === 1) await p.dropBox.delete(space, tag, d.id).catch(() => undefined);
+        continue;
+      }
       if (g) {
         // One Welcome can carry secrets for several of this person's devices: leave it for the others.
         if (msg.welcome.secrets.length === 1) await p.dropBox.delete(space, tag, d.id);
@@ -893,7 +898,12 @@ export class Chat {
     return undefined;
   }
 
-  private async joinWithWelcome(space: SpaceRef, welcome: mls.Welcome): Promise<Group | undefined> {
+  /**
+   * `'stale'`: a Welcome from an earlier time in the group, our device taken out of it since (we
+   * left, were removed, or declined). Joining with it would put us epochs behind, and the resync
+   * that follows skips everything sent since the re-add.
+   */
+  private async joinWithWelcome(space: SpaceRef, welcome: mls.Welcome): Promise<Group | undefined | 'stale'> {
     const cs = await ciphersuite();
     const eph = this.opts.device.ephemeral;
     for (const s of welcome.secrets) {
@@ -929,6 +939,7 @@ export class Chat {
       const scan = await scanLog(raw);
       const at = await logIndexOf(raw, state.groupContext);
       if (at === undefined) continue; // the commit that added us is not in the log: not this group
+      if (removedSince(raw, scan, state.groupContext.epoch, b64(this.identity.publicKey))) return 'stale';
       // One-time keys are deleted the moment they are used (box 2). Last-resort keys stay.
       if (key.startsWith('chat/kp/')) await eph.delete(key);
       const meta = this.newMeta(b64(state.groupContext.groupId), space, at + 1, scan.hashes[at]!);
@@ -1269,6 +1280,27 @@ async function scanLog(raw: Bytes[]): Promise<LogScan> {
   }
   if (!lastGi) throw new KeyholdError('bad_format', 'log has no GroupInfo');
   return { hashes, lastHash: prev, lastGi, usedNonces, epochIndex };
+}
+
+/**
+ * Was this device out of the group at some epoch after `epoch`? Each epoch's tree is the one in
+ * the first commit for it, as members apply (a later commit for the same epoch is a lost race).
+ */
+function removedSince(raw: Bytes[], scan: LogScan, epoch: bigint, device: string): boolean {
+  for (const [ep, i] of scan.epochIndex) {
+    if (BigInt(ep) <= epoch) continue;
+    let e: LogEntry;
+    try {
+      e = parseJsonBytes<LogEntry>(raw[i]!, 'log entry');
+      if (e.kind !== 'commit' || !e.gi) continue;
+      const m = decodeMsg(unb64(e.gi));
+      if (m.wireformat !== 'mls_group_info') continue;
+      if (!leavesOfGroupInfo(m.groupInfo).some((l) => l.device === device)) return true;
+    } catch {
+      continue;
+    }
+  }
+  return false;
 }
 
 /** Leaf index of the member that signed a Welcome's GroupInfo (joinGroup verifies the signature). */
