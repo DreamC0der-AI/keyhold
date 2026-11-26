@@ -121,6 +121,11 @@ interface LogEntry {
    * posted after the commit. Someone this commit adds reads repeated fast sends only from there.
    */
   mail?: string;
+  /**
+   * The first commit of someone who joined with a Welcome (or by external commit): when they
+   * accepted (ms, the joiner's clock). Others show "joined" at this time, not when they noticed.
+   */
+  at?: number;
 }
 
 const hashEntry = async (b: Bytes) => b64(await sha256(b));
@@ -178,6 +183,8 @@ interface GroupMeta {
   adminsReset?: boolean;
   /** Our leaf came from a pre-key: commit a fresh one (cleared only by a commit of ours). */
   freshLeaf?: boolean;
+  /** When this device accepted the invitation (see `Chat.join`): sent with the fresh-leaf commit. */
+  acceptedAt?: number;
   /** Epoch we joined at: older mail can't be ours to read, so it is skipped quietly. */
   joinedEpoch?: string;
   /**
@@ -392,7 +399,11 @@ function removersOf(members: MemberLeaf[], removes: { removed: number; sender: n
 export type GroupEvent =
   /** Someone was added with pre-keys; they can read what is sent from now on once they join. */
   | { type: 'added'; fingerprint: string; address: Address }
-  | { type: 'joined'; fingerprint: string; address: Address }
+  /**
+   * `at`: when they accepted, as their commit says (never later than now). Absent when the
+   * commit doesn't say (older apps, or our own join).
+   */
+  | { type: 'joined'; fingerprint: string; address: Address; at?: number }
   /**
    * `pending`: they were added but never joined (declined, expired, or removed before joining).
    * `by`: someone else removed them (an admin); absent when they left on their own.
@@ -512,6 +523,13 @@ export class Chat {
   readonly groups = new Map<string, Group>();
   /** Joins in flight, by space: a second join of the same space waits for the first. */
   private joining = new Map<SpaceRef, Promise<Group | undefined>>();
+  /** `join(space, { acceptedAt })` while that join runs: when the person accepted. */
+  private acceptedAt = new Map<SpaceRef, number>();
+  private acceptedTime(space: SpaceRef) {
+    const now = this.now();
+    const at = this.acceptedAt.get(space);
+    return at !== undefined && at <= now ? at : now;
+  }
   readonly opts: Required<Omit<ChatOptions, 'onMessage'>> & Pick<ChatOptions, 'onMessage'>;
 
   private constructor(opts: ChatOptions) {
@@ -767,7 +785,7 @@ export class Chat {
    * Join one space: with a Welcome (offline add), as another device of a member (self-join),
    * or with a valid ticket for this address. Returns undefined when nothing lets us in.
    */
-  join(space: SpaceRef): Promise<Group | undefined> {
+  join(space: SpaceRef, opts: { acceptedAt?: number } = {}): Promise<Group | undefined> {
     // Two joins of one space must never both succeed: each would hold its own copy of the group
     // state, both would commit, and each copy rejects the other's commits, so the device forks off
     // the group. A join that overlaps one in flight shares its result; a space already joined
@@ -776,7 +794,11 @@ export class Chat {
     if (have) return Promise.resolve(have);
     let run = this.joining.get(space);
     if (!run) {
-      run = this.joinNow(space).finally(() => this.joining.delete(space));
+      if (opts.acceptedAt !== undefined) this.acceptedAt.set(space, opts.acceptedAt);
+      run = this.joinNow(space).finally(() => {
+        this.joining.delete(space);
+        this.acceptedAt.delete(space);
+      });
       this.joining.set(space, run);
     }
     return run;
@@ -866,6 +888,7 @@ export class Chat {
         epoch: String(newState.groupContext.epoch),
         mls: b64(encodeMsg({ wireformat: 'mls_public_message', version: 'mls10', publicMessage })),
         gi: await groupInfoBytes(newState, cs),
+        at: this.acceptedTime(space),
       };
       const bytes = jsonBytes(entry);
       if ((await p.orderedLog.append(space, index, bytes)) !== 'ok') continue; // someone committed first: retry on the new epoch
@@ -983,6 +1006,7 @@ export class Chat {
       }
       // Our leaf still holds the reusable pre-key: replace it with a fresh key on the next sync.
       meta.freshLeaf = true;
+      meta.acceptedAt = this.acceptedTime(space);
       const g = new Group(this, meta, state);
       await g.persist();
       this.groups.set(meta.groupId, g);
@@ -2224,6 +2248,7 @@ export class Group {
         mls: b64(encodeMsg(res.commit)),
         gi: await groupInfoBytes(res.newState, cs),
         ...(this.meta.mailCursor !== undefined && res.welcome ? { mail: this.meta.mailCursor } : {}),
+        ...(this.meta.freshLeaf && this.meta.acceptedAt !== undefined ? { at: this.meta.acceptedAt } : {}),
       };
       const bytes = jsonBytes(entry);
       // Keep the would-be state until we know whether the append landed: if the app dies right
@@ -2257,6 +2282,7 @@ export class Group {
         this.meta.needsHeal = false;
         // An add-only commit carries no new key for our leaf.
         if (this.meta.freshLeaf) this.meta.freshLeaf = unjoinedLeaf(this.state.ratchetTree[this.myLeaf * 2] as mls.NodeLeaf);
+        if (!this.meta.freshLeaf) delete this.meta.acceptedAt;
         await this.persist();
         await dev.ephemeral.delete(pendingKey);
         return res;
@@ -2687,18 +2713,21 @@ export class Group {
     }
     if (e.kind !== 'commit') return;
     const after = this.members();
-    this.diffMembers(before, out, removers);
+    const at = typeof e.at === 'number' && Number.isFinite(e.at) ? Math.min(e.at, this.chat.now()) : undefined;
+    this.diffMembers(before, out, removers, at);
     const np = this.policy;
     if (JSON.stringify(np) !== JSON.stringify(policy)) out.events.push({ type: 'policy', policy: np });
   }
 
   /** `removers`: who removed whom in this commit (see removersOf); anyone else gone left. */
-  private diffMembers(before: Member[], out: SyncResult, removers?: Map<string, Remover>) {
+  /** `at`: the commit's own time for anyone it shows joining (see LogEntry.at). */
+  private diffMembers(before: Member[], out: SyncResult, removers?: Map<string, Remover>, at?: number) {
     const after = this.members();
+    const stamp = at !== undefined ? { at } : {};
     for (const m of after) {
       const b = before.find((x) => x.fingerprint === m.fingerprint);
-      if (!b) out.events.push({ type: m.pending ? 'added' : 'joined', fingerprint: m.fingerprint, address: m.address });
-      else if (b.pending && !m.pending) out.events.push({ type: 'joined', fingerprint: m.fingerprint, address: m.address });
+      if (!b) out.events.push(m.pending ? { type: 'added', fingerprint: m.fingerprint, address: m.address } : { type: 'joined', fingerprint: m.fingerprint, address: m.address, ...stamp });
+      else if (b.pending && !m.pending) out.events.push({ type: 'joined', fingerprint: m.fingerprint, address: m.address, ...stamp });
     }
     for (const b of before) {
       if (after.some((m) => m.fingerprint === b.fingerprint)) continue;
@@ -2853,6 +2882,7 @@ export class Group {
         epoch: String(newState.groupContext.epoch),
         mls: b64(encodeMsg({ wireformat: 'mls_public_message', version: 'mls10', publicMessage })),
         gi: await groupInfoBytes(newState, cs),
+        ...(this.meta.freshLeaf && this.meta.acceptedAt !== undefined ? { at: this.meta.acceptedAt } : {}),
       };
       const bytes = jsonBytes(entry);
       // As in commit: keep the would-be state until we know whether the append landed.
@@ -2871,6 +2901,7 @@ export class Group {
       this.meta.rejoin = undefined;
       this.meta.needsHeal = false;
       this.meta.freshLeaf = undefined;
+      delete this.meta.acceptedAt;
       this.meta.sentSinceUpdate = 0;
       this.meta.lastUpdateAt = this.chat.now();
       // Like any joiner: what was written before this epoch can't be opened here.

@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { MemoryWorld } from '../src/storage/index.js';
 import { makeUser, addDevice, texts, type TestUserOptions } from './chat-helpers.js';
-import type { Group, GroupEvent } from '../src/chat/index.js';
+import type { Chat, Group, GroupEvent } from '../src/chat/index.js';
 
 const DAY = 86_400_000;
 
@@ -14,6 +14,15 @@ function setup() {
 }
 
 const pendingOf = (g: Group) => g.members().filter((m) => m.pending).map((m) => m.address);
+/** What acceptInvites does before it joins: take the channel grant, so the space can be read. */
+async function acceptGrant(chat: Chat) {
+  const p = chat.provider;
+  for (const n of await p.inviteInbox.list()) {
+    await p.channel.acceptGrant(n.pointer);
+    await p.inviteInbox.delete(n.id);
+  }
+  return (await p.channel.listSpaces())[0]!;
+}
 const types = (events: GroupEvent[]) => events.map((e) => e.type);
 
 describe('pre-keys (build option preKeys)', () => {
@@ -75,6 +84,37 @@ describe('pre-keys (build option preKeys)', () => {
     expect(texts(await g.sync())).toEqual(['hi all']);
   });
 
+  it('"joined" carries when they accepted, not when the others noticed their commit', async () => {
+    const { w, opts, now, advance } = setup();
+    const bob = await makeUser(w.session('mem:bob'), 'mem:bob', opts);
+    const carol = await makeUser(w.session('mem:carol'), 'mem:carol', opts);
+    await carol.chat.refreshPreKey();
+    const g = await bob.chat.createGroup('group');
+    await g.invite(carol.address);
+    const acceptedAt = now();
+    advance(15_000); // the joining steps take a while; bob writes meanwhile
+    const space = await acceptGrant(carol.chat);
+    const gc = await carol.chat.join(space, { acceptedAt });
+    await gc!.sync(); // commits the fresh leaf
+    advance(60_000); // bob's app notices a minute later
+    const r = await g.sync();
+    expect(r.events).toContainEqual({ type: 'joined', fingerprint: carol.identity.fingerprint, address: 'mem:carol', at: acceptedAt });
+  });
+
+  it('a "joined" time from the future is cut to now', async () => {
+    const { w, opts, now } = setup();
+    const bob = await makeUser(w.session('mem:bob'), 'mem:bob', opts);
+    const carol = await makeUser(w.session('mem:carol'), 'mem:carol', opts);
+    await carol.chat.refreshPreKey();
+    const g = await bob.chat.createGroup('group');
+    await g.invite(carol.address);
+    const space = await acceptGrant(carol.chat);
+    const gc = await carol.chat.join(space, { acceptedAt: now() + 3_600_000 });
+    await gc!.sync();
+    const joined = (await g.sync()).events.find((e) => e.type === 'joined');
+    expect(joined).toMatchObject({ at: now() });
+  });
+
   it('the joiner replaces its pre-key leaf even when other commits came first', async () => {
     const { w, opts } = setup();
     const bob = await makeUser(w.session('mem:bob'), 'mem:bob', opts);
@@ -89,7 +129,7 @@ describe('pre-keys (build option preKeys)', () => {
     const [gc] = await carol.chat.acceptInvites();
     await gc!.sync();
     const r = await g.sync();
-    expect(r.events).toContainEqual({ type: 'joined', fingerprint: carol.identity.fingerprint, address: 'mem:carol' });
+    expect(r.events).toContainEqual(expect.objectContaining({ type: 'joined', fingerprint: carol.identity.fingerprint, address: 'mem:carol' }));
     expect(pendingOf(g)).toEqual(['mem:dave']);
   });
 
