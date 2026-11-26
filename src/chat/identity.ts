@@ -279,6 +279,8 @@ export type LookupResult =
  */
 export class IdentityRegistry {
   private cache = new Map<Address, { view: DirectoryView; at: number }>();
+  /** The root each address publishes now, trusted or not, and when it was last read. */
+  private published = new Map<Address, { fingerprint: string; at: number }>();
   constructor(
     private directory: PublicDirectory,
     readonly pins: PinStore = new MemoryPinStore(),
@@ -289,6 +291,7 @@ export class IdentityRegistry {
     const view = await verifyDirectory(await this.directory.read(address));
     if (!view) return { status: 'none' };
     if (view.address !== address) throw new KeyholdError('bad_format', `directory of ${address} claims to be ${view.address}`);
+    this.published.set(address, { fingerprint: view.fingerprint, at: this.now() });
     const pin = await this.pins.get(address);
     if (pin && pin.fingerprint !== view.fingerprint) return { status: 'key-changed', view, pinned: pin };
     if (pin && view.hashes[pin.index] !== pin.hash) {
@@ -302,6 +305,7 @@ export class IdentityRegistry {
 
   /** User accepted a key change (after comparing safety numbers, ideally). */
   async acceptKeyChange(address: Address, view: DirectoryView) {
+    this.published.set(address, { fingerprint: view.fingerprint, at: this.now() });
     const head = view.hashes.length - 1;
     await this.pins.set(address, { fingerprint: view.fingerprint, index: head, hash: view.hashes[head]! });
     this.cache.set(address, { view, at: this.now() });
@@ -318,6 +322,26 @@ export class IdentityRegistry {
 
   cachedAt(address: Address): number | undefined {
     return this.cache.get(address)?.at;
+  }
+
+  /**
+   * The root fingerprint `address` publishes now, as of its last lookup, whether or not it is the
+   * pinned one. A device whose certificate names another root belongs to a key the person reset
+   * (or lost): it can never be used again.
+   */
+  publishedRoot(address: Address): string | undefined {
+    return this.published.get(address)?.fingerprint;
+  }
+
+  /** When `address` was last read from the directory (any result but none), else undefined. */
+  lookedAt(address: Address): number | undefined {
+    return this.published.get(address)?.at;
+  }
+
+  /** A device of `address` certified by `root` belongs to a key that address no longer publishes. */
+  isResetRoot(root: string, address: Address): boolean {
+    const now = this.publishedRoot(address);
+    return now !== undefined && now !== root;
   }
 
   /** Synchronous check against cached directories (used inside MLS validation callbacks). */

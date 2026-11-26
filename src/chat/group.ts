@@ -17,6 +17,7 @@ import * as mls from 'ts-mls';
 import { unprotectPrivateMessage } from 'ts-mls/messageProtection.js';
 import { makeKeyPackageRef } from 'ts-mls/keyPackage.js';
 import { decodeRatchetTree } from 'ts-mls/ratchetTree.js';
+import { verifyGroupInfoSignature } from 'ts-mls/groupInfo.js';
 import { decryptSenderData } from 'ts-mls/privateMessage.js';
 import { decryptGroupInfo, decryptGroupSecrets } from 'ts-mls/welcome.js';
 import { accumulatePskSecret } from 'ts-mls/pskIndex.js';
@@ -168,6 +169,13 @@ interface GroupMeta {
   removed?: boolean;
   /** The channel refuses us (for example the owner revoked access after removing us). */
   accessLost?: boolean;
+  /** Root fingerprints of members already reported as reset (their address publishes another key). */
+  resetSeen?: string[];
+  /**
+   * Every admin in the group reset their key: nobody is left who may remove or add people, so the
+   * group is over. Set once, never cleared; from then on this device applies nothing and sends nothing.
+   */
+  adminsReset?: boolean;
   /** Our leaf came from a pre-key: commit a fresh one (cleared only by a commit of ours). */
   freshLeaf?: boolean;
   /** Epoch we joined at: older mail can't be ours to read, so it is skipped quietly. */
@@ -410,6 +418,17 @@ export type GroupEvent =
    * deletes them from this device, and from any history backup. See `ChatOptions.sendFreshMs`.
    */
   | { type: 'retracted'; ids: string[] }
+  /**
+   * This person's address now publishes another root key (they reset their key, or lost it): the
+   * devices of `fingerprint` can never be used again. An admin's app removes them by itself; the
+   * person comes back only if someone invites their new key. Reported once per key.
+   */
+  | { type: 'key-reset'; fingerprint: string; address: Address }
+  /**
+   * Every admin of the group reset their key, so nobody can manage it any more: the group is
+   * over on this device (it applies and sends nothing from now on). Reported once.
+   */
+  | { type: 'admins-reset'; admins: Address[] }
   /** We are out of the group. `by`: who removed us, when we can tell (absent when we left). */
   | { type: 'removed'; by?: Remover }
   | { type: 'rotated'; epoch: bigint }
@@ -1357,6 +1376,42 @@ function leavesOfGroupInfo(gi: mls.GroupInfo): MemberLeaf[] {
   return tree ? leaves({ ratchetTree: tree } as unknown as mls.ClientState) : [];
 }
 
+/**
+ * Spaces `address` manages whose group was run only by keys of `address` other than `keep`
+ * (keys it reset or lost), judged from each space's newest GroupInfo: every admin of the group
+ * that is in it is a device of `address` with another root. Nobody can manage those groups any
+ * more (members' apps end them, see `admins-reset`), so the app may delete the spaces. Reads
+ * each space's whole log: meant to run once, after a reset.
+ */
+export async function spacesRunByLostKeys(provider: StorageProvider, address: Address, keep?: string): Promise<SpaceRef[]> {
+  const out: SpaceRef[] = [];
+  const cs = await ciphersuite();
+  for (const space of await provider.channel.listSpaces()) {
+    try {
+      if (!(await provider.channel.canManage(space))) continue;
+      const raw = await provider.orderedLog.read(space, 0);
+      if (!raw.length) continue;
+      const scan = await scanLog(raw);
+      const m = decodeMsg(unb64(scan.lastGi));
+      if (m.wireformat !== 'mls_group_info') continue;
+      const policy = decodePolicy(m.groupInfo.groupContext.extensions as never);
+      const all = leavesOfGroupInfo(m.groupInfo);
+      const admins = policy.admins.filter((a) => all.some((l) => l.root === a));
+      const lost = (a: string) => a !== keep && all.some((l) => l.root === a && l.address === address);
+      if (!admins.length || !admins.every(lost)) continue;
+      // Signed by a device in its own tree (whoever committed last). A member could still forge
+      // one with made-up rules; the most that buys them is the owner deleting a space it owns.
+      const signer = all.find((l) => l.leafIndex === m.groupInfo.signer);
+      if (!signer) continue;
+      if (!(await verifyGroupInfoSignature(m.groupInfo, unb64(signer.device), cs.signature))) continue;
+      out.push(space);
+    } catch {
+      /* unreadable: leave it alone */
+    }
+  }
+  return out;
+}
+
 function decodeTree(b: Uint8Array): mls.RatchetTree {
   const r = decodeRatchetTree(b, 0);
   if (!r) throw new KeyholdError('bad_format', 'bad ratchet tree');
@@ -1430,7 +1485,45 @@ export class Group {
     return this.meta.avatar;
   }
   get active() {
-    return !this.meta.removed && !this.meta.accessLost && this.state.groupActiveState.kind === 'active';
+    return !this.meta.removed && !this.meta.accessLost && !this.meta.adminsReset && this.state.groupActiveState.kind === 'active';
+  }
+
+  /** Every admin reset their key: the group is over (see `admins-reset`). */
+  get endedByReset() {
+    return !!this.meta.adminsReset;
+  }
+
+  /**
+   * Members whose address now publishes another root key, as of the directories last read
+   * (`checkResets` reads them now), and whether that leaves the group without an admin.
+   * `adminsGone`: some admin is in the group and every admin in it is reset.
+   */
+  resets(): { people: { fingerprint: string; address: Address }[]; adminsGone: boolean } {
+    const registry = this.chat.opts.registry;
+    const me = this.chat.identity.fingerprint;
+    const all = leaves(this.state);
+    const reset = (l: MemberLeaf) => l.root !== me && registry.isResetRoot(l.root, l.address);
+    const people = new Map<string, { fingerprint: string; address: Address }>();
+    for (const l of all) if (reset(l)) people.set(l.root, { fingerprint: l.root, address: l.address });
+    const admins = this.policy.admins.filter((a) => all.some((l) => l.root === a));
+    const adminsGone = admins.length > 0 && admins.every((a) => people.has(a));
+    return { people: [...people.values()], adminsGone };
+  }
+
+  /** Read every member's directory now, then `resets()`. For a group GitHub stopped serving. */
+  async checkResets(): Promise<ReturnType<Group['resets']>> {
+    const registry = this.chat.opts.registry;
+    for (const a of new Set(leaves(this.state).map((l) => l.address))) {
+      if (a === this.chat.identity.address) continue;
+      await registry.lookup(a).catch(() => undefined);
+    }
+    return this.resets();
+  }
+
+  /** Our own address publishes another key: this device's identity is gone (reset on another device). */
+  private selfReset() {
+    const id = this.chat.identity;
+    return this.chat.opts.registry.isResetRoot(id.fingerprint, id.address);
   }
   get policy(): GroupPolicy {
     return decodePolicy(this.state.groupContext.extensions as never);
@@ -1794,6 +1887,11 @@ export class Group {
     if (policy.adds === 'none' || (policy.adds === 'admins' && !policy.admins.includes(me.fingerprint))) {
       throw new KeyholdError('policy_rejected', 'you may not invite people to this group');
     }
+    // Invited back after a key reset: the devices of their old key go first, so the new key
+    // takes their seat and their own app doesn't find its address in the group with another key.
+    const oldKeys = () =>
+      leaves(this.state).filter((l) => l.leafIndex !== this.myLeaf && people.some((p) => !p.error && p.view && p.address === l.address && p.view.fingerprint !== l.root));
+    if (oldKeys().length) await this.commit(() => oldKeys().map((t) => ({ proposalType: 'remove', remove: { removed: t.leafIndex } }) as mls.Proposal), () => oldKeys().length > 0);
     const inGroup = new Set(leaves(this.state).map((l) => l.root));
     // People with a device that joined: their channel access is theirs to keep.
     const joined = new Set(leaves(this.state).filter((l) => !unjoinedLeaf(this.state.ratchetTree[l.leafIndex * 2] as mls.NodeLeaf)).map((l) => l.address));
@@ -2220,7 +2318,7 @@ export class Group {
 
   private async syncInner(withAutomation: boolean): Promise<SyncResult> {
     const out = this.buffered;
-    if (this.meta.removed) return out;
+    if (this.meta.removed || this.meta.adminsReset) return out;
     const p = this.chat.provider;
     const space = this.meta.space;
 
@@ -2614,7 +2712,7 @@ export class Group {
     const registry = this.chat.opts.registry;
     // Re-read members' directories now and then, so revoked devices get removed.
     for (const m of this.members()) {
-      const at = registry.cachedAt(m.address);
+      const at = registry.lookedAt(m.address);
       if (at === undefined || this.chat.now() - at > this.chat.opts.directoryMaxAgeMs) {
         try {
           await registry.lookup(m.address);
@@ -2623,6 +2721,9 @@ export class Group {
         }
       }
     }
+    // Our own key was reset on another device: this device must not change the group any more.
+    if (this.selfReset()) return;
+    if (await this.handleResets(out)) return;
     // Devices revoked in their owner's directory: removed and banned by an admin or by another
     // device of the same person (the only members the policy lets do it).
     const me = this.chat.identity.fingerprint;
@@ -2654,6 +2755,43 @@ export class Group {
       await this.answerJoinRequests();
     }
     await this.reconcileNow();
+  }
+
+  /**
+   * Members whose address publishes another root key now (a key reset): report each once, and
+   * if this device is an admin, take their devices out of the group (the channel access follows
+   * in reconcile). Removing a key nobody can use again harms nobody, so no one is asked. Returns
+   * true when every admin reset: the group is over and nothing else may happen in it.
+   */
+  private async handleResets(out: SyncResult): Promise<boolean> {
+    const { people, adminsGone } = this.resets();
+    const seen = new Set(this.meta.resetSeen ?? []);
+    let changed = false;
+    for (const p of people) {
+      if (seen.has(p.fingerprint)) continue;
+      seen.add(p.fingerprint);
+      changed = true;
+      out.events.push({ type: 'key-reset', fingerprint: p.fingerprint, address: p.address });
+    }
+    if (changed) this.meta.resetSeen = [...seen];
+    if (adminsGone) {
+      this.meta.adminsReset = true;
+      const all = leaves(this.state);
+      const admins = [...new Set(this.policy.admins.flatMap((a) => all.filter((l) => l.root === a).map((l) => l.address)))];
+      out.events.push({ type: 'admins-reset', admins });
+      await this.persist();
+      return true;
+    }
+    if (changed) await this.persist();
+    if (!people.length || !this.policy.admins.includes(this.chat.identity.fingerprint)) return false;
+    const gone = new Set(people.map((p) => p.fingerprint));
+    const targets = () => leaves(this.state).filter((l) => gone.has(l.root) && l.leafIndex !== this.myLeaf && this.chat.opts.registry.isResetRoot(l.root, l.address));
+    try {
+      await this.commit(() => targets().map((t) => ({ proposalType: 'remove', remove: { removed: t.leafIndex } }) as mls.Proposal), () => targets().length > 0);
+    } catch (err) {
+      if ((err as KeyholdError).code !== 'policy_rejected') throw err;
+    }
+    return false;
   }
 
   /**
