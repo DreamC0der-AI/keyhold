@@ -171,7 +171,7 @@ describe('pre-keys (build option preKeys)', () => {
     await g.invite(carol.address);
     for (const k of await carol.device.ephemeral.keys('chat/pk/')) await carol.device.ephemeral.delete(k);
     const [gc] = await carol.chat.acceptInvites();
-    expect(gc).toBeDefined();
+    await gc!.sync();
     await g.sync();
     const c = g.members().find((m) => m.address === 'mem:carol')!;
     expect(c.devices).toHaveLength(1);
@@ -277,5 +277,46 @@ describe('pre-keys (build option preKeys)', () => {
       const [joined] = await u.chat.acceptInvites();
       expect(texts(await joined!.sync())).toContain('hi both');
     }
+  });
+
+  it('someone who joined with a pre-key and was removed loses channel access, and a new invite reaches their inbox', async () => {
+    const { w, opts } = setup();
+    const bob = await makeUser(w.session('mem:bob'), 'mem:bob', opts);
+    const carol = await makeUser(w.session('mem:carol'), 'mem:carol', opts);
+    await carol.chat.refreshPreKey();
+    const g = await bob.chat.createGroup('group', 'team');
+    await g.invite(carol.address);
+    const [gc] = await carol.chat.acceptInvites();
+    await gc!.sync();
+    await g.sync();
+    expect(pendingOf(g)).toEqual([]);
+    await g.remove(carol.identity.fingerprint);
+    // Her unused ticket from the first invite must not keep her in the repo.
+    expect((await bob.provider.channel.members(g.space)).active).not.toContain(carol.address);
+    await carol.chat.refreshPreKey();
+    await g.invite(carol.address);
+    expect((await carol.provider.inviteInbox.list()).length).toBeGreaterThan(0);
+  });
+
+  it('inviting someone who still has channel access but is not in the group sends a fresh invitation', async () => {
+    const { w, opts } = setup();
+    const bob = await makeUser(w.session('mem:bob'), 'mem:bob', opts);
+    const carol = await makeUser(w.session('mem:carol'), 'mem:carol', opts);
+    await carol.chat.refreshPreKey();
+    const g = await bob.chat.createGroup('group', 'team');
+    await g.invite(carol.address);
+    const [gc] = await carol.chat.acceptInvites();
+    await gc!.sync();
+    await g.sync();
+    // Out of the group, but still a member of the space (as left behind by older versions).
+    await (g as unknown as { exclusive(f: () => Promise<void>): Promise<void>; commit(p: unknown[]): Promise<unknown>; state: never }).exclusive(async () => {
+      const leaf = g.members().find((m) => m.address === carol.address)!.devices[0]!.leafIndex;
+      await (g as unknown as { commit(p: unknown[]): Promise<unknown> }).commit([{ proposalType: 'remove', remove: { removed: leaf } }]);
+    });
+    expect((await bob.provider.channel.members(g.space)).active).toContain(carol.address);
+    for (const n of await carol.provider.inviteInbox.list()) await carol.provider.inviteInbox.delete(n.id);
+    await carol.chat.refreshPreKey();
+    await g.invite(carol.address);
+    expect((await carol.provider.inviteInbox.list()).length).toBeGreaterThan(0);
   });
 });
