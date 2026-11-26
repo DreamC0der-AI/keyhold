@@ -115,6 +115,11 @@ interface LogEntry {
   mls?: string;
   /** GroupInfo (with ratchet tree and external pub) for `epoch`. */
   gi?: string;
+  /**
+   * The committer's mailbox cursor when it made this commit: mail listed after it may have been
+   * posted after the commit. Someone this commit adds reads repeated fast sends only from there.
+   */
+  mail?: string;
 }
 
 const hashEntry = async (b: Bytes) => b64(await sha256(b));
@@ -193,6 +198,14 @@ interface GroupMeta {
    * have without the repeat.
    */
   joinedByCommit?: boolean;
+  /**
+   * Added by someone else's Welcome (and no device of ours was in before): the adder's mailbox
+   * cursor at the add (`LogEntry.mail`). A repeated fast send is ours only if its original was
+   * listed after that cursor, i.e. it may have been posted after we were added.
+   */
+  addedAtMail?: string;
+  /** When we joined by that Welcome: the check above stops after a day (repeats come soon). */
+  addedAtMailSince?: number;
   /** Recent messages from others marked `fast`, by epoch: retracted if we turn out to be removed. */
   fastSeen?: { id: string; epoch: string }[];
   /** Hashes of our recent ciphertexts: our own mail even when we never learnt its id. */
@@ -924,6 +937,20 @@ export class Chat {
       meta.usedNonces = [...(await scanLog(raw.slice(0, at + 1))).usedNonces];
       meta.mailCursor = undefined; // messages after the add are readable; older ones are skipped
       meta.joinedEpoch = String(state.groupContext.epoch);
+      // Someone new to the group (no device of ours had joined it): note where the add happened in
+      // the mail, so a repeat of something sent before it isn't read here.
+      const mine = leaves(state).some((l) => l.root === this.identity.fingerprint && l.device !== b64(this.identity.publicKey) && !unjoinedLeaf(state.ratchetTree[l.leafIndex * 2] as mls.NodeLeaf));
+      const addEntry = (() => {
+        try {
+          return parseJsonBytes<LogEntry>(raw[at]!, 'log entry');
+        } catch {
+          return undefined;
+        }
+      })();
+      if (!mine && typeof addEntry?.mail === 'string') {
+        meta.addedAtMail = addEntry.mail;
+        meta.addedAtMailSince = this.now();
+      }
       // Our leaf still holds the reusable pre-key: replace it with a fresh key on the next sync.
       meta.freshLeaf = true;
       const g = new Group(this, meta, state);
@@ -2066,6 +2093,7 @@ export class Group {
         epoch: String(res.newState.groupContext.epoch),
         mls: b64(encodeMsg(res.commit)),
         gi: await groupInfoBytes(res.newState, cs),
+        ...(this.meta.mailCursor !== undefined && res.welcome ? { mail: this.meta.mailCursor } : {}),
       };
       const bytes = jsonBytes(entry);
       // Keep the would-be state until we know whether the append landed: if the app dies right
@@ -2273,7 +2301,31 @@ export class Group {
     return out;
   }
 
+  /** Hashes of mail listed after `addedAtMail` (read once per sync, only when a repeat needs it). */
+  private mailAfterAdd?: Set<string>;
+
+  /** A repeat (`orig`) of a fast send: readable here unless its original went up before we joined. */
+  private async mayReadRepeat(orig: string): Promise<boolean> {
+    if (this.meta.joinedByCommit) return !!this.meta.seenHashes?.includes(orig);
+    if (this.meta.addedAtMail === undefined) return true;
+    if (this.chat.now() - (this.meta.addedAtMailSince ?? 0) > DAY) {
+      delete this.meta.addedAtMail;
+      delete this.meta.addedAtMailSince;
+      return true;
+    }
+    if (!this.mailAfterAdd) {
+      try {
+        const { items } = await this.chat.provider.mailbox.list(this.meta.space, this.meta.addedAtMail);
+        this.mailAfterAdd = new Set(await Promise.all(items.map((i) => hashEntry(i.data))));
+      } catch {
+        return true; // can't tell: better a message too many than one lost
+      }
+    }
+    return this.mailAfterAdd.has(orig);
+  }
+
   private async drainPending(out: SyncResult, ready: (epoch: string) => boolean) {
+    this.mailAfterAdd = undefined;
     if (!this.active) return;
     const keep: GroupMeta['pending'] = [];
     for (const item of this.meta.pending) {
@@ -2284,7 +2336,7 @@ export class Group {
       try {
         const m = await this.openApplication(unb64(item.data));
         // A repeat of a fast send whose original went up before we joined: not ours to read.
-        if (m && m.message.orig && this.meta.joinedByCommit && !this.meta.seenHashes?.includes(m.message.orig)) continue;
+        if (m && m.message.orig && !(await this.mayReadRepeat(m.message.orig))) continue;
         if (m) {
           if (m.message.fast) this.meta.fastSeen = [...(this.meta.fastSeen ?? []), { id: m.message.id, epoch: String(m.epoch) }].slice(-200);
           await this.handleSystem(m);

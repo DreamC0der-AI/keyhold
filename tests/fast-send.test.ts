@@ -245,3 +245,48 @@ describe('a fast send that reaches someone just removed', () => {
     expect(texts(await g.sync())).toContain('right after');
   });
 });
+
+describe('a fast send and someone an admin adds with a pre-key', () => {
+  async function trio() {
+    const clock = { t: Date.now() }; // pre-key lifetimes are checked against the real clock
+    const now = () => clock.t;
+    const w = new MemoryWorld({ claimOnce: false, now });
+    const opts: TestUserOptions = { now, sendFreshMs: FRESH, build: { preKeys: true } };
+    const bob = await makeUser(w.session('mem:bob'), 'mem:bob', opts);
+    const carol = await makeUser(w.session('mem:carol'), 'mem:carol', opts);
+    const dave = await makeUser(w.session('mem:dave'), 'mem:dave', opts);
+    for (const u of [carol, dave]) await u.chat.refreshPreKey();
+    const g = await bob.chat.createGroup();
+    await g.invite(carol.address);
+    const [gc] = await carol.chat.acceptInvites();
+    for (let r = 0; r < 3; r++) for (const x of [g, gc!]) await x.sync();
+    clock.t += SETTLE + 1;
+    return { bob, carol, dave, g, gc: gc! };
+  }
+
+  it('a repeat of what carol sent before bob added dave is not shown to dave', async () => {
+    const { dave, g, gc } = await trio();
+    await gc.sync();
+    const sent = await gc.send({ t: 'text', body: 'before dave' }); // fast
+    await g.sync(); // bob has seen it...
+    await g.invite(dave.address); // ...then adds dave
+    await gc.sync(); // carol sees the add and repeats her message
+    expect(ids(await g.sync())).toContain(sent.id);
+    const [gd] = await dave.chat.acceptInvites();
+    expect(texts(await gd!.sync())).toEqual([]);
+    await gc.send({ t: 'text', body: 'after' });
+    expect(texts(await gd!.sync())).toEqual(['after']);
+  });
+
+  it('what carol sent just after the add, before she saw it, still reaches dave', async () => {
+    const { dave, g, gc } = await trio();
+    await gc.sync();
+    await g.invite(dave.address); // bob adds dave; carol hasn't seen it
+    const sent = await gc.send({ t: 'text', body: 'right after the add' }); // fast, old epoch
+    await gc.sync(); // carol sees the add and repeats it
+    const [gd] = await dave.chat.acceptInvites();
+    const got = await gd!.sync();
+    expect(texts(got)).toEqual(['right after the add']);
+    expect(ids(got)).toEqual([sent.id]);
+  });
+});
