@@ -66,6 +66,7 @@ Keyhold ships only the in-memory provider. Channel providers belong to the apps 
 - **Directory** (box 3): a root-signed, hash-chained log of `init`, `device-add`, `device-revoke`, `profile`, `last-resort-kp`.
 - **Trust on first use**: `IdentityRegistry` pins the fingerprint and chain head. A different root gives `key-changed` (never auto-accepted). A rewritten chain throws `rewrite_detected`. `PersonalData.pinStore()` keeps pins with contacts, so all your devices trust the same keys.
 - `safetyNumber(a, b)`: 60 digits, the same on both sides, for comparison out of band.
+- **Key reset**: a person who lost their root key publishes a new directory under the same address. A member's device whose certificate names the old root is dead (`IdentityRegistry.isResetRoot`). Each group reports `key-reset` once per such key; an admin's device removes those devices by itself, and the person comes back only when someone invites the new key (after `acceptKeyChange`; inviting removes any old-key devices first). When every admin in a group reset, the group is over: each member's device reports `admins-reset` and from then on applies and sends nothing (`Group.endedByReset`). `spacesRunByLostKeys` finds the spaces the new key may delete for that reason. A device whose own address publishes another root stops changing its groups.
 
 ## 4. Groups
 
