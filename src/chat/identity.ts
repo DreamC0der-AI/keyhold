@@ -287,7 +287,18 @@ export class IdentityRegistry {
     private now: () => number = Date.now,
   ) {}
 
-  async lookup(address: Address): Promise<LookupResult> {
+  /** Lookups under way: callers asking for the same address at once share one read. */
+  private looking = new Map<Address, Promise<LookupResult>>();
+
+  lookup(address: Address): Promise<LookupResult> {
+    const cur = this.looking.get(address);
+    if (cur) return cur;
+    const run = this.lookupNow(address).finally(() => this.looking.delete(address));
+    this.looking.set(address, run);
+    return run;
+  }
+
+  private async lookupNow(address: Address): Promise<LookupResult> {
     const view = await verifyDirectory(await this.directory.read(address));
     if (!view) return { status: 'none' };
     if (view.address !== address) throw new KeyholdError('bad_format', `directory of ${address} claims to be ${view.address}`);
