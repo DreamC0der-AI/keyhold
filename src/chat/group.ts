@@ -762,6 +762,12 @@ export class Chat {
       if (g) {
         // One Welcome can carry secrets for several of this person's devices: leave it for the others.
         if (msg.welcome.secrets.length === 1) await p.dropBox.delete(space, tag, d.id);
+        // Our ticket for this group went unused: drop it, or it would keep our channel access
+        // (the owner's app spares anyone holding a live ticket) after a later removal.
+        for (const t of drops) {
+          const ticket = decodeTicket(t.data);
+          if (ticket && ticket.to === this.identity.address && ticket.group === g.id) await p.dropBox.delete(space, tag, t.id).catch(() => undefined);
+        }
         return g;
       }
     }
@@ -1716,6 +1722,8 @@ export class Group {
       throw new KeyholdError('policy_rejected', 'you may not invite people to this group');
     }
     const inGroup = new Set(leaves(this.state).map((l) => l.root));
+    // People with a device that joined: their channel access is theirs to keep.
+    const joined = new Set(leaves(this.state).filter((l) => !unjoinedLeaf(this.state.ratchetTree[l.leafIndex * 2] as mls.NodeLeaf)).map((l) => l.address));
     let room = policy.maxPeople > 0 ? policy.maxPeople - inGroup.size : Infinity;
     for (const p of people) {
       if (p.error) continue;
@@ -1747,7 +1755,7 @@ export class Group {
     const grant = async (p: PreparedInvite) => {
       try {
         const payload = options.note && p.kps.length && this.chat.opts.features.inboxPayload ? await sealInviteNote(options.note, p.kps, me.address) : undefined;
-        await this.grantChannel(p.address, expiresAt, payload);
+        await this.grantChannel(p.address, expiresAt, payload, !joined.has(p.address));
       } catch (error) {
         p.error = error as Error;
       }
@@ -1848,9 +1856,15 @@ export class Group {
     return undefined;
   }
 
-  private async grantChannel(address: Address, expiresAt: number, payload?: Bytes) {
+  /**
+   * `fresh`: they aren't in the group, so they must get an invitation they can see and accept.
+   * Still having channel access (left over from before a removal) would send none: take it away
+   * and invite again.
+   */
+  private async grantChannel(address: Address, expiresAt: number, payload?: Bytes, fresh = false) {
     const p = this.chat.provider;
-    const r = await p.channel.grant(this.meta.space, address);
+    let r = await p.channel.grant(this.meta.space, address);
+    if (r.status === 'already-member' && fresh && (await p.channel.revoke(this.meta.space, address)) === 'done') r = await p.channel.grant(this.meta.space, address);
     if (r.status === 'invited') {
       await p.inviteInbox.send(address, payload ? { pointer: r.pointer, payload } : { pointer: r.pointer });
     } else if (r.status === 'needs-manager') {
@@ -1899,6 +1913,11 @@ export class Group {
     const address = targets[0]!.address;
     await this.commit(targets.map((t) => ({ proposalType: 'remove', remove: { removed: t.leafIndex } }) as mls.Proposal));
     await this.persist();
+    // Tickets and Welcomes still waiting for them would let them back in, and a live ticket keeps
+    // their channel access (reconcile spares invitees): a removal ends both.
+    const box = this.chat.provider.dropBox;
+    const tag = await recipientTag(address);
+    for (const d of await box.list(this.meta.space, tag).catch(() => [])) await box.delete(this.meta.space, tag, d.id).catch(() => undefined);
     await this.reconcileNow(true);
   }
 
