@@ -14,10 +14,10 @@
  *   per item per flush.
  */
 import { randomBytes, toBase64Url } from '../util/bytes.js';
-import { jsonBytes, parseJsonBytes } from '../util/codec.js';
+import { canonicalJson, jsonBytes, parseJsonBytes } from '../util/codec.js';
 import { KeyholdError } from '../util/errors.js';
 import { open, seal } from '../crypto/index.js';
-import type { Address, PersonalStore } from '../storage/interfaces.js';
+import type { Address, DeviceKeystore, PersonalStore } from '../storage/interfaces.js';
 import { mayBackUp } from '../storage/requirements.js';
 import type { Pin, PinStore } from './identity.js';
 
@@ -45,6 +45,23 @@ const COLLECTION_TYPE: Record<Collection, string> = {
 };
 
 const INDEX_ID = 'i';
+/** Device copies (box 1), see `PersonalOptions.local`. */
+const LOCAL_INDEX = 'personal/index';
+const LOCAL_ITEM = 'personal/item/';
+/** Collections not copied to the device: large, and only for restoring other devices. */
+const NOT_LOCAL = new Set<string>(['history']);
+
+export interface PersonalOptions {
+  /**
+   * This device's keystore (box 1). With it, every record (except the history backup) is also
+   * kept on the device, sealed with K, and merged with what the store returns. The storage
+   * operator can then no longer roll a record back or delete it unnoticed: what this device
+   * already knew is merged back in and written again by the next flush (`repairs` counts
+   * them). This matters most for the TOFU pins kept with contacts (see `pinStore`): without a
+   * device copy, deleting a contact record resets trust in that person's key. Recommended.
+   */
+  local?: DeviceKeystore;
+}
 const later = (a: Stamp, b: Stamp) => a.t > b.t || (a.t === b.t && a.d > b.d);
 
 export interface ContactRecord {
@@ -82,6 +99,8 @@ export class PersonalData {
   /** Versions already seen by `changes()`. */
   private seen = new Map<string, string>();
   private clock = 0;
+  /** Records the store returned older than this device's copy (or not at all), since open. */
+  repairs = 0;
 
   private constructor(
     private store: PersonalStore,
@@ -89,23 +108,39 @@ export class PersonalData {
     private indexKey: CryptoKey,
     private deviceId: string,
     private now: () => number,
+    private local?: DeviceKeystore,
   ) {}
 
-  static async open(store: PersonalStore, key: CryptoKey, deviceId: string, now: () => number = Date.now): Promise<PersonalData> {
+  static async open(store: PersonalStore, key: CryptoKey, deviceId: string, now: () => number = Date.now, options: PersonalOptions = {}): Promise<PersonalData> {
     const ctx = { type: 'personal-index' };
+    const local = options.local;
+    // The index key never changes once made. If the store lost it, the device copy puts it back
+    // (a new one would make every record unreachable, pins included).
+    const kept = local ? await local.get(LOCAL_INDEX) : undefined;
     for (let attempt = 0; attempt < 5; attempt++) {
       const cur = await store.get(INDEX_ID);
       let raw: Uint8Array<ArrayBuffer>;
       if (cur) raw = await open(key, cur.data, ctx);
       else {
-        raw = randomBytes(32);
+        raw = kept ? await open(key, kept, ctx) : randomBytes(32);
         if ((await store.put(INDEX_ID, await seal(key, raw, ctx), null)) !== 'ok') continue; // another device made it first
       }
+      if (local) await local.put(LOCAL_INDEX, await seal(key, raw, ctx));
       const indexKey = await crypto.subtle.importKey('raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
       raw.fill(0);
-      return new PersonalData(store, key, indexKey, deviceId, now);
+      return new PersonalData(store, key, indexKey, deviceId, now, local);
     }
     throw new KeyholdError('conflict', 'could not set up the personal store');
+  }
+
+  private async readLocal(id: string): Promise<Item | undefined> {
+    const b = this.local ? await this.local.get(LOCAL_ITEM + id) : undefined;
+    return b ? parseJsonBytes<Item>(await open(this.key, b, this.ctx(id))) : undefined;
+  }
+
+  private async writeLocal(id: string, item: Item) {
+    if (!this.local || NOT_LOCAL.has(item.c)) return;
+    await this.local.put(LOCAL_ITEM + id, await seal(this.key, jsonBytes(item), this.ctx(id), { compress: true }));
   }
 
   private stamp(): Stamp {
@@ -124,12 +159,30 @@ export class PersonalData {
 
   private async load(id: string): Promise<{ item: Item; version: string } | undefined> {
     const v = await this.store.get(id);
-    if (!v) return undefined;
-    const item = parseJsonBytes<Item>(await open(this.key, v.data, this.ctx(id)));
+    const remote = v ? parseJsonBytes<Item>(await open(this.key, v.data, this.ctx(id))) : undefined;
+    const kept = await this.readLocal(id);
+    const item = merge(remote, kept);
+    if (!item) return undefined;
     for (const f of Object.values(item.f)) this.clock = Math.max(this.clock, f.t);
-    const entry = { item, version: v.version };
+    if (kept && (!remote || canonicalJson(merge(remote, undefined)) !== canonicalJson(item))) {
+      // The store is behind what this device knew (rolled back, or the record deleted):
+      // write what we know back with the next flush. Merging is order-free, so this is safe.
+      this.repairs++;
+      this.queue.set(id, merge(kept, this.queue.get(id))!);
+    }
+    if (remote && canonicalJson(merge(remote, undefined)) !== canonicalJson(kept ?? null)) await this.writeLocal(id, item);
+    const entry = { item, version: v?.version ?? '' };
     this.cache.set(id, entry);
     return entry;
+  }
+
+  /** Record ids in the store and, with a device copy, those this device knows of. */
+  private async ids(): Promise<{ id: string; version: string }[]> {
+    const listed = await this.store.list();
+    if (!this.local) return listed;
+    const have = new Set(listed.map((x) => x.id));
+    const extra = (await this.local.keys(LOCAL_ITEM)).map((k) => k.slice(LOCAL_ITEM.length)).filter((id) => !have.has(id));
+    return [...listed, ...extra.map((id) => ({ id, version: '' }))];
   }
 
   /**
@@ -166,8 +219,8 @@ export class PersonalData {
    */
   async changes(): Promise<{ collection: Collection; key: string; value: Record<string, unknown> }[]> {
     const out: { collection: Collection; key: string; value: Record<string, unknown> }[] = [];
-    for (const { id, version } of await this.store.list()) {
-      if (id === INDEX_ID || this.seen.get(id) === version) continue;
+    for (const { id, version } of await this.ids()) {
+      if (id === INDEX_ID || (version !== '' && this.seen.get(id) === version) || (version === '' && this.seen.has(id))) continue;
       const e = await this.load(id);
       if (!e) continue;
       this.seen.set(id, e.version);
@@ -191,7 +244,7 @@ export class PersonalData {
   /** All records of a collection. Reads every item: fine for small collections. */
   async list<T extends object = Record<string, unknown>>(collection: Collection): Promise<{ key: string; value: T }[]> {
     const out: { key: string; value: T }[] = [];
-    for (const { id } of await this.store.list()) {
+    for (const { id } of await this.ids()) {
       if (id === INDEX_ID) continue;
       const e = await this.load(id);
       if (!e || e.item.c !== collection) continue;
@@ -226,11 +279,13 @@ export class PersonalData {
       try {
         for (let attempt = 0; ; attempt++) {
           if (attempt > 8) throw new KeyholdError('conflict', 'personal store kept changing');
-          const cur = await this.load(id);
-          const merged = merge(cur?.item, q)!;
+          const v = await this.store.get(id);
+          const cur = v ? parseJsonBytes<Item>(await open(this.key, v.data, this.ctx(id))) : undefined;
+          const merged = merge(merge(cur, await this.readLocal(id)), q)!;
           const sealed = await seal(this.key, jsonBytes(merged), this.ctx(id), { compress: true });
-          if ((await this.store.put(id, sealed, cur?.version ?? null)) === 'ok') {
+          if ((await this.store.put(id, sealed, v?.version ?? null)) === 'ok') {
             writes++;
+            await this.writeLocal(id, merged);
             this.cache.delete(id); // its version changed; read it again when needed
             break;
           }

@@ -220,7 +220,7 @@ describe('malicious storage operator: forged Welcome and GroupInfo (C2)', () => 
     expect(await talks(g, gc!, 'not eve')).toBe(true);
   });
 
-  it('a look-alike GroupInfo planted in the log (with a forged ticket) is refused; the join works once a member commits', async () => {
+  it('a look-alike GroupInfo planted in the log (with a forged ticket) is ignored: the join goes to the real group', async () => {
     const { w, opts } = preKeyWorld();
     const bob = await makeUser(w.session('mem:bob'), 'mem:bob', opts);
     const dave = await makeUser(w.session('mem:dave'), 'mem:dave', opts); // no pre-key: joins by ticket
@@ -237,18 +237,14 @@ describe('malicious storage operator: forged Welcome and GroupInfo (C2)', () => 
       (m) => cs.signature.sign(mallory.identity.signKey, m),
     );
     await plantDrop(w, g.space, dave.address, encodeTicket(forgedTicket));
-    const [first] = await dave.chat.acceptInvites();
-    expect(first).toBeUndefined();
-    expect(dave.chat.groups.size).toBe(0);
-    // An honest commit puts an honest GroupInfo on top; now the real ticket works.
-    await g.sync();
-    await g.rotate();
-    const gd = await dave.chat.join(g.space);
+    // A GroupInfo on an entry members don't apply never steers a joiner: dave joins the real
+    // group with the real ticket, and the forged one is never tried.
+    const [gd] = await dave.chat.acceptInvites();
     expect(gd!.members().find((m) => m.address === 'mem:bob')!.fingerprint).toBe(bob.identity.fingerprint);
     expect(await talks(g, gd!, 'real group')).toBe(true);
   });
 
-  it('a look-alike GroupInfo that lets a "self-join" through (another device of mine in the tree) is refused', async () => {
+  it('a look-alike GroupInfo that would let a "self-join" through (another device of mine in the tree) is ignored', async () => {
     const { w, opts } = preKeyWorld();
     const bob = await makeUser(w.session('mem:bob'), 'mem:bob', opts);
     const carol = await makeUser(w.session('mem:carol'), 'mem:carol', opts);
@@ -260,10 +256,7 @@ describe('malicious storage operator: forged Welcome and GroupInfo (C2)', () => 
     const fake = await fakeGroup(mallory, g.id, [await preKeyOf(w, carol.address)]);
     await operatorAppend(w, g.space, { kind: 'proposal', epoch: String(g.epoch), gi: await giBytes(fake.state) });
     for (const n of await laptop.provider.inviteInbox.list()) await laptop.provider.channel.acceptGrant(n.pointer);
-    expect(await laptop.chat.join(g.space)).toBeUndefined();
-    // Once the newest GroupInfo is honest again, the laptop self-joins the real group.
-    await g.sync();
-    await g.rotate();
+    // The planted GroupInfo is ignored: the laptop self-joins the real group.
     const gl = await laptop.chat.join(g.space);
     expect(gl!.members().find((m) => m.address === 'mem:bob')!.fingerprint).toBe(bob.identity.fingerprint);
   });

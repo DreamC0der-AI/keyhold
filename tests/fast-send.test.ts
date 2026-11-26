@@ -188,3 +188,33 @@ describe('a group made a moment ago', () => {
     expect(w.calls.get('log.read')).toBe(before + 1);
   });
 });
+
+describe('a fast send that reaches someone just removed', () => {
+  it('the removed device is told to take it back; the others keep it', async () => {
+    const clock = { t: 1_700_000_000_000 };
+    const now = () => clock.t;
+    const w = new MemoryWorld({ claimOnce: false, now });
+    const opts: TestUserOptions = { now, sendFreshMs: FRESH };
+    const bob = await makeUser(w.session('mem:bob'), 'mem:bob', opts);
+    const carol = await makeUser(w.session('mem:carol'), 'mem:carol', opts);
+    const eve = await makeUser(w.session('mem:eve'), 'mem:eve', opts);
+    const g = await bob.chat.createGroup();
+    await g.invite(carol.address);
+    await g.invite(eve.address);
+    const [gc] = await carol.chat.acceptInvites();
+    const [ge] = await eve.chat.acceptInvites();
+    for (let r = 0; r < 3; r++) for (const x of [g, gc!, ge!]) await x.sync();
+    clock.t += SETTLE + 1;
+    await gc!.sync(); // carol is fresh...
+    await g.remove(eve.identity.fingerprint); // ...and bob removes eve now
+    w.spaces.get(g.space)!.members.add(eve.address); // a channel whose access removal lags
+    const sent = await gc!.send({ t: 'text', body: 'right after' }); // carol hasn't seen it
+    expect(sent.fast).toBe(true);
+    const r = await ge!.sync();
+    expect(r.events).toEqual(expect.arrayContaining([{ type: 'retracted', ids: [sent.id] }, expect.objectContaining({ type: 'removed' })]));
+    expect(texts(r)).not.toContain('right after');
+    // carol's next sync sends it again in the new epoch; bob has it either way.
+    await gc!.sync();
+    expect(texts(await g.sync())).toContain('right after');
+  });
+});
