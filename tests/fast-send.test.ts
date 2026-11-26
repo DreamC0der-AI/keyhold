@@ -115,6 +115,34 @@ describe('a fast send that was late after all', () => {
     expect(texts(await gc.sync())).toEqual([]);
   });
 
+  it('a device that joined after the message went up does not get the repeat', async () => {
+    const { w, opts, carol, g, gc } = await pair();
+    await g.sync();
+    const sent = await g.send({ t: 'text', body: 'before anyone new' }); // fast, in the current epoch
+    const dave = await makeUser(w.session('mem:dave'), 'mem:dave', opts);
+    await g.invite(dave.address); // a ticket only (no pre-keys): dave joins by his own commit
+    const [gd] = await dave.chat.acceptInvites();
+    // bob's next sync sees dave's join and repeats the message, which only carol gets.
+    await g.sync();
+    expect(ids(await gc.sync())).toContain(sent.id);
+    expect(texts(await gd!.sync())).toEqual([]);
+    void carol;
+  });
+
+  it('a repeat whose original went up before the joiner joined is not shown to it', async () => {
+    const { opts, carol, g, gc } = await pair();
+    await g.sync();
+    const sent = await g.send({ t: 'text', body: 'sent before the laptop joined' });
+    // carol's laptop joins by its own commit after that, unseen by bob: bob repeats his message.
+    const laptop = await addDevice(carol, opts);
+    const gl = (await laptop.chat.join(g.space)) as Group;
+    await g.sync();
+    expect(ids(await gc.sync())).toContain(sent.id);
+    expect(texts(await gl.sync())).toEqual([]);
+    await g.send({ t: 'text', body: 'after' });
+    expect(texts(await gl.sync())).toEqual(['after']);
+  });
+
   it("our own key change right after is not a reason to send again", async () => {
     const { g, gc, posts } = await pair();
     await g.sync();

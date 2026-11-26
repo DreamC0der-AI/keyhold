@@ -185,7 +185,14 @@ interface GroupMeta {
    * Messages sent without a sync first (`sendFreshMs`), with the epoch they were encrypted in.
    * If a later sync finds the group had already moved on, they are sent again in the new epoch.
    */
-  fastSent?: { message: AppMessage; epoch: string; at: number; tries?: number }[];
+  fastSent?: { message: AppMessage; epoch: string; at: number; tries?: number; hash?: string }[];
+  /**
+   * Joined by our own commit (no Welcome), so mail from before the join was never listed here. A
+   * repeated fast send (`orig`) is then ours to read only if we saw its original (`seenHashes`),
+   * i.e. it was posted after we joined; one posted before we joined stays unread, as it would
+   * have without the repeat.
+   */
+  joinedByCommit?: boolean;
   /** Recent messages from others marked `fast`, by epoch: retracted if we turn out to be removed. */
   fastSeen?: { id: string; epoch: string }[];
   /** Hashes of our recent ciphertexts: our own mail even when we never learnt its id. */
@@ -835,6 +842,7 @@ export class Chat {
       meta.mailCursor = (await p.mailbox.list(space)).cursor;
       // Also one posted after this, by someone who had not seen us join yet: not an error.
       meta.joinedEpoch = String(newState.groupContext.epoch);
+      meta.joinedByCommit = true;
       const g = new Group(this, meta, newState);
       await g.persist();
       this.groups.set(meta.groupId, g);
@@ -1509,7 +1517,7 @@ export class Group {
     this.meta.ownHashes = [...(this.meta.ownHashes ?? []), ...batch.map((b) => b.hash)];
     if (fast) {
       const at = this.chat.now();
-      this.meta.fastSent = [...(this.meta.fastSent ?? []), ...batch.map((b) => ({ message: b.message, epoch: b.epoch, at }))].slice(-MAX_FAST_SENT);
+      this.meta.fastSent = [...(this.meta.fastSent ?? []), ...batch.map((b) => ({ message: b.message, epoch: b.epoch, at, hash: b.hash }))].slice(-MAX_FAST_SENT);
     }
     await this.persist();
     await this.postOutbox(batch);
@@ -1538,7 +1546,7 @@ export class Group {
     try {
       // The copy went out after a sync: not `fast` (it is the one a removed device never gets).
       await this.encryptAndPost(
-        stale.map(({ message: { fast: _f, ...m } }) => m as AppMessage),
+        stale.map(({ message: { fast: _f, ...m }, hash }) => (hash ? { ...m, orig: hash } : m) as AppMessage),
         false,
       );
     } catch {
@@ -2274,6 +2282,8 @@ export class Group {
       }
       try {
         const m = await this.openApplication(unb64(item.data));
+        // A repeat of a fast send whose original went up before we joined: not ours to read.
+        if (m && m.message.orig && this.meta.joinedByCommit && !this.meta.seenHashes?.includes(m.message.orig)) continue;
         if (m) {
           if (m.message.fast) this.meta.fastSeen = [...(this.meta.fastSeen ?? []), { id: m.message.id, epoch: String(m.epoch) }].slice(-200);
           await this.handleSystem(m);

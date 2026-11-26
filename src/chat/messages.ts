@@ -38,8 +38,10 @@ export type AppContent =
 /**
  * `fast`: sent without a sync first (`ChatOptions.sendFreshMs`). A device that turns out to have
  * been removed in that epoch is told to take such messages back (`retracted` event).
+ *
+ * `orig`: this is a repeat (see `repostStale`) of the fast-sent ciphertext with this hash.
  */
-export type AppMessage = AppContent & { v: 1; id: string; ts: number; fast?: true };
+export type AppMessage = AppContent & { v: 1; id: string; ts: number; fast?: true; orig?: string };
 
 const TYPES = new Set(['text', 'edit', 'delete', 'react', 'receipt', 'attachment', 'meta', 'sys.grant', 'sys.close']);
 
