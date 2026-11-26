@@ -129,18 +129,17 @@ describe('a fast send that was late after all', () => {
     void carol;
   });
 
-  it('a repeat whose original went up before the joiner joined is not shown to it', async () => {
+  it("a new device of someone already in still gets a repeat of what went up just before it joined", async () => {
     const { opts, carol, g, gc } = await pair();
     await g.sync();
     const sent = await g.send({ t: 'text', body: 'sent before the laptop joined' });
     // carol's laptop joins by its own commit after that, unseen by bob: bob repeats his message.
+    // carol was in the group when it went up, so her new device may read it.
     const laptop = await addDevice(carol, opts);
     const gl = (await laptop.chat.join(g.space)) as Group;
     await g.sync();
     expect(ids(await gc.sync())).toContain(sent.id);
-    expect(texts(await gl.sync())).toEqual([]);
-    await g.send({ t: 'text', body: 'after' });
-    expect(texts(await gl.sync())).toEqual(['after']);
+    expect(texts(await gl.sync())).toEqual(['sent before the laptop joined']);
   });
 
   it("our own key change right after is not a reason to send again", async () => {

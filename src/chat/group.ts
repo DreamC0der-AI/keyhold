@@ -842,7 +842,8 @@ export class Chat {
       meta.mailCursor = (await p.mailbox.list(space)).cursor;
       // Also one posted after this, by someone who had not seen us join yet: not an error.
       meta.joinedEpoch = String(newState.groupContext.epoch);
-      meta.joinedByCommit = true;
+      // Another device of ours was in already: this person may read what went up just before.
+      if (!selfJoin) meta.joinedByCommit = true;
       const g = new Group(this, meta, newState);
       await g.persist();
       this.groups.set(meta.groupId, g);
