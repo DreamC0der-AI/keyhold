@@ -210,6 +210,58 @@ describe('pre-keys (build option preKeys)', () => {
     expect(g.members()).toHaveLength(1);
   });
 
+  it('a decline takes them out at once on the inviter\'s device; what is sent after can\'t be read by them', async () => {
+    const { w, opts } = setup();
+    const bob = await makeUser(w.session('mem:bob'), 'mem:bob', opts);
+    const carol = await makeUser(w.session('mem:carol'), 'mem:carol', opts);
+    await carol.chat.refreshPreKey();
+    const g = await bob.chat.createGroup('group', 'team');
+    await g.invite(carol.address);
+    await g.send({ t: 'text', body: 'before' });
+    await w.session('mem:bob').channel.revoke(g.space, carol.address); // she declined
+    // No 10-minute grace: this device made the invitation, so a missing one means it ended.
+    await g.reconcileChannel(true);
+    expect(g.members()).toHaveLength(1);
+    await g.send({ t: 'text', body: 'Ok' });
+    // Her first Welcome is gone with her: only the new invite lets her in, from now on.
+    await carol.chat.refreshPreKey();
+    await g.invite(carol.address);
+    await g.send({ t: 'text', body: 'after' });
+    const [gc] = await carol.chat.acceptInvites();
+    expect(texts(await gc!.sync())).toEqual(['after']);
+  });
+
+  it('a re-invite before the decline was noticed replaces their old leaf, so they can\'t read the gap', async () => {
+    const { w, opts } = setup();
+    const bob = await makeUser(w.session('mem:bob'), 'mem:bob', opts);
+    const carol = await makeUser(w.session('mem:carol'), 'mem:carol', opts);
+    await carol.chat.refreshPreKey();
+    const g = await bob.chat.createGroup('group', 'team');
+    await g.invite(carol.address);
+    await g.sync();
+    await w.session('mem:bob').channel.revoke(g.space, carol.address); // she declined
+    await g.send({ t: 'text', body: 'Ok' }); // before bob's device noticed
+    await g.invite(carol.address);
+    await g.send({ t: 'text', body: 'after' });
+    const [gc] = await carol.chat.acceptInvites();
+    expect(texts(await gc!.sync())).toEqual(['after']);
+    expect(g.members().filter((m) => m.address === carol.address)).toHaveLength(1);
+  });
+
+  it('a re-sent invitation that is still open keeps their leaf and what was sent meanwhile', async () => {
+    const { w, opts } = setup();
+    const bob = await makeUser(w.session('mem:bob'), 'mem:bob', opts);
+    const carol = await makeUser(w.session('mem:carol'), 'mem:carol', opts);
+    await carol.chat.refreshPreKey();
+    const g = await bob.chat.createGroup('group', 'team');
+    await g.invite(carol.address);
+    await g.send({ t: 'text', body: 'one' });
+    await g.invite(carol.address);
+    await g.send({ t: 'text', body: 'two' });
+    const [gc] = await carol.chat.acceptInvites();
+    expect(texts(await gc!.sync())).toEqual(['one', 'two']);
+  });
+
   it('skips expired pre-keys and pre-keys of revoked devices; the ticket still works', async () => {
     const { w, opts, advance } = setup();
     const bob = await makeUser(w.session('mem:bob'), 'mem:bob', opts);

@@ -174,6 +174,11 @@ interface GroupMeta {
   rejoin?: { at: number; gi: string };
   /** When this device first saw each device leaf that was added but hasn't joined (admins clean up). */
   unjoinedSince?: Record<string, number>;
+  /**
+   * When this device last made a channel invitation for each address. Once that invitation is
+   * gone (declined, expired, withdrawn), their unjoined leaves go at once, with no grace period.
+   */
+  grantedAt?: Record<string, number>;
   /** Our messages, encrypted and saved, not yet known to be posted. A retry posts the same bytes. */
   outbox?: OutboxItem[];
   /**
@@ -1732,6 +1737,7 @@ export class Group {
       else room--;
     }
     const ok = people.filter((p) => !p.error);
+    await this.dropEndedInvitees(ok.filter((p) => !joined.has(p.address)).map((p) => p.address));
     // With pre-keys, add every device of theirs that has one now, so the group can write to
     // them before they accept. The ticket still goes out: it lets a device that has no usable
     // pre-key (or whose Welcome can't be opened) join when they accept.
@@ -1865,6 +1871,7 @@ export class Group {
     const p = this.chat.provider;
     let r = await p.channel.grant(this.meta.space, address);
     if (r.status === 'already-member' && fresh && (await p.channel.revoke(this.meta.space, address)) === 'done') r = await p.channel.grant(this.meta.space, address);
+    if (r.status === 'invited' || r.status === 'already-member') (this.meta.grantedAt ??= {})[address] = this.chat.now();
     if (r.status === 'invited') {
       await p.inviteInbox.send(address, payload ? { pointer: r.pointer, payload } : { pointer: r.pointer });
     } else if (r.status === 'needs-manager') {
@@ -1915,9 +1922,7 @@ export class Group {
     await this.persist();
     // Tickets and Welcomes still waiting for them would let them back in, and a live ticket keeps
     // their channel access (reconcile spares invitees): a removal ends both.
-    const box = this.chat.provider.dropBox;
-    const tag = await recipientTag(address);
-    for (const d of await box.list(this.meta.space, tag).catch(() => [])) await box.delete(this.meta.space, tag, d.id).catch(() => undefined);
+    await this.clearDrops(address);
     await this.reconcileNow(true);
   }
 
@@ -2741,7 +2746,8 @@ export class Group {
     }
   }
 
-  private async removeUnjoined(gone?: (l: MemberLeaf) => boolean) {
+  /** `gone(leaf, unjoinedFor)`: their invitation ended, so the leaf goes now. */
+  private async removeUnjoined(gone?: (l: MemberLeaf, unjoinedForMs: number) => boolean) {
     const now = this.chat.now();
     const since = (this.meta.unjoinedSince ??= {});
     const unjoined = () => leaves(this.state).filter((l) => l.leafIndex !== this.myLeaf && unjoinedLeaf(this.state.ratchetTree[l.leafIndex * 2] as mls.NodeLeaf));
@@ -2754,13 +2760,44 @@ export class Group {
     // A pre-key leaf of a device that also joined with a leaf of its own is a leftover: two leaves
     // with one signature key make the tree invalid for anyone joining, so it goes at once.
     const joinedTwice = (l: MemberLeaf) => leaves(this.state).some((o) => o.leafIndex !== l.leafIndex && o.device === l.device && !unjoinedLeaf(this.state.ratchetTree[o.leafIndex * 2] as mls.NodeLeaf));
-    const due = () => unjoined().filter((l) => joinedTwice(l) || now - (since[l.device] ?? now) >= deadline || (gone?.(l) && now - (since[l.device] ?? now) >= 10 * 60_000));
+    const due = () => unjoined().filter((l) => joinedTwice(l) || now - (since[l.device] ?? now) >= deadline || gone?.(l, now - (since[l.device] ?? now)));
     if (!due().length) return;
+    const goneBefore = new Set(due().filter((l) => gone?.(l, now - (since[l.device] ?? now))).map((l) => l.address));
     try {
       await this.commit(() => due().map((l) => ({ proposalType: 'remove', remove: { removed: l.leafIndex } }) as mls.Proposal), () => due().length > 0);
     } catch (err) {
       if ((err as KeyholdError).code !== 'policy_rejected') throw err;
+      return;
     }
+    // Their invitation ended: the Welcome and ticket left for them would still let them in later,
+    // at the epoch of that old add, so they could read what was sent after they said no.
+    const left = new Set(leaves(this.state).map((l) => l.address));
+    for (const a of goneBefore) if (!left.has(a)) await this.clearDrops(a);
+  }
+
+  /** Delete every Welcome and ticket waiting for this address in the space. */
+  private async clearDrops(address: Address) {
+    const box = this.chat.provider.dropBox;
+    const tag = await recipientTag(address);
+    for (const d of await box.list(this.meta.space, tag).catch(() => [])) await box.delete(this.meta.space, tag, d.id).catch(() => undefined);
+  }
+
+  /**
+   * Before inviting people again: anyone whose earlier invitation ended (declined, expired,
+   * withdrawn) but whose pre-key leaves are still in the group loses those leaves and their old
+   * Welcome first, so the new invite adds them afresh and they can't read the gap in between.
+   */
+  private async dropEndedInvitees(addresses: Address[]) {
+    const unjoinedOf = (a: Address) =>
+      leaves(this.state).some((l) => l.address === a && l.leafIndex !== this.myLeaf && unjoinedLeaf(this.state.ratchetTree[l.leafIndex * 2] as mls.NodeLeaf));
+    const stale = addresses.filter(unjoinedOf);
+    if (!stale.length) return;
+    const ch = this.chat.provider.channel;
+    if (!(await ch.canManage(this.meta.space))) return;
+    const { active, pending } = await ch.members(this.meta.space);
+    const invited = new Set<Address>([...active, ...pending]);
+    const ended = new Set(stale.filter((a) => !invited.has(a)));
+    if (ended.size) await this.removeUnjoined((l) => ended.has(l.address));
   }
 
   private async reconcileNow(force = false): Promise<{ revoked: Address[] }> {
@@ -2768,14 +2805,24 @@ export class Group {
     if (!this.active || !(await ch.canManage(this.meta.space))) return { revoked: [] };
     const now = this.chat.now();
     const sig = leaves(this.state).map((l) => l.leafIndex + l.root).join();
-    if (!force && this.lastMembership === sig && now - (this.meta.lastReconcile ?? 0) < 10 * 60_000) return { revoked: [] };
+    // While someone this device invited hasn't joined, look every 2 minutes: a decline should take
+    // them out of the encryption soon. Otherwise every 10 minutes.
+    const granted = this.meta.grantedAt ?? {};
+    const waiting = leaves(this.state).some((l) => granted[l.address] !== undefined && unjoinedLeaf(this.state.ratchetTree[l.leafIndex * 2] as mls.NodeLeaf));
+    const every = waiting ? 2 * 60_000 : 10 * 60_000;
+    if (!force && this.lastMembership === sig && now - (this.meta.lastReconcile ?? 0) < every) return { revoked: [] };
     this.lastMembership = sig;
     this.meta.lastReconcile = now;
     const { active, pending } = await ch.members(this.meta.space);
     // Added with pre-keys, but their channel invitation is gone (declined or expired): they can
     // never join, so take them out of the group too.
     const invited = new Set<Address>([...active, ...pending]);
-    await this.removeUnjoined((l) => !invited.has(l.address));
+    // A grace period for invitations made elsewhere (another device, or the owner's app on an
+    // admin's behalf): the invitation follows the add, so give it 10 minutes to show up.
+    await this.removeUnjoined((l, unjoinedFor) => !invited.has(l.address) && (granted[l.address] !== undefined || unjoinedFor >= 10 * 60_000));
+    // Forget invitations of people who are gone and not invited any more.
+    const inTree = new Set(leaves(this.state).map((l) => l.address));
+    for (const a of Object.keys(granted)) if (!inTree.has(a) && !invited.has(a)) delete granted[a];
     const candidates: Address[] = [];
     const keep0 = new Set<Address>([ch.self, ...leaves(this.state).map((l) => l.address)]);
     for (const a of new Set([...active, ...pending])) if (!keep0.has(a) && !(await this.findTicket(a))) candidates.push(a);
